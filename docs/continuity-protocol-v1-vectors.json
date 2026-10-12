@@ -1,0 +1,380 @@
+{
+  "protocol": "noisedeck-continuity-succession-v1",
+  "schema_version": 1,
+  "action_vocabulary": [
+    "accept",
+    "accept_revision_1",
+    "change_source_generation",
+    "concurrent_registrations_at_byte_limit",
+    "crash_each_cutover_boundary",
+    "crash_each_publication_boundary",
+    "create_other_nonterminal_grant_participation",
+    "enter_each_terminal_offer_state",
+    "expire",
+    "finalize",
+    "inspect_control_surfaces",
+    "no_questions",
+    "observe_credential_unknown",
+    "observe_liveness_unknown",
+    "observe_source_dead",
+    "observe_source_fenced",
+    "owner_accept",
+    "owner_question",
+    "probe_source_and_sibling",
+    "propose",
+    "propose_bootstrap_uncertain",
+    "propose_cross_domain",
+    "propose_revision_2",
+    "propose_same_candidate",
+    "propose_with_symlink_swap",
+    "publish_answer",
+    "publish_receipt",
+    "race_accept_decline",
+    "race_two_proposals",
+    "receiver_propose",
+    "receiver_release",
+    "reconcile",
+    "register_canary_artifacts",
+    "release",
+    "remove_object",
+    "request_question",
+    "request_question_over_bound",
+    "restart",
+    "restore_live_grant_backup",
+    "retry",
+    "retry_losing_declaration",
+    "retry_same_propose",
+    "reuse_key_different_candidate",
+    "revoke"
+  ],
+  "assertion_vocabulary": [
+    "admitted_offers",
+    "artifact_count",
+    "bootstrap_attempts",
+    "capability",
+    "capability_authority",
+    "capability_rebound",
+    "cas_winners",
+    "credential_authority",
+    "cutover",
+    "epoch_delta",
+    "error",
+    "fence_transactional",
+    "grant_authority",
+    "grant_capability",
+    "grant_state",
+    "killed_by_expiry",
+    "launch_delta",
+    "launched_processes",
+    "max_charge_per_transition",
+    "max_objects",
+    "max_receipts",
+    "max_transfer_charge",
+    "new_side_effects",
+    "offer_capabilities",
+    "offer_count",
+    "offer_state",
+    "oversubscribed",
+    "owner",
+    "path_escape",
+    "policy_authority",
+    "process_count",
+    "receiver",
+    "recorded_result_stable",
+    "rejected_actions",
+    "reservation_delta",
+    "semantic_control_bytes",
+    "side_effects",
+    "successor_activated",
+    "terminal_states_checked",
+    "transfer_delta",
+    "unapproved_bytes_read",
+    "unreceipted_projection",
+    "visible_artifacts",
+    "visible_domains"
+  ],
+  "cases": [
+    {
+      "id": "V01-happy-no-questions",
+      "actions": [
+        "propose",
+        "no_questions",
+        "accept",
+        "release",
+        "observe_source_fenced",
+        "finalize"
+      ],
+      "offer_state": "active",
+      "owner": "successor",
+      "launch_delta": -1,
+      "transfer_delta": -1,
+      "epoch_delta": 1
+    },
+    {
+      "id": "V02-one-round",
+      "actions": [
+        "propose",
+        "request_question",
+        "publish_answer",
+        "accept",
+        "release",
+        "observe_source_fenced",
+        "finalize"
+      ],
+      "offer_state": "active",
+      "owner": "successor",
+      "artifact_count": 3,
+      "semantic_control_bytes": 0
+    },
+    {
+      "id": "V03-round-overflow",
+      "actions": [
+        "propose",
+        "request_question",
+        "publish_answer",
+        "request_question_over_bound"
+      ],
+      "error": "round_bound_exhausted",
+      "reservation_delta": 0
+    },
+    {
+      "id": "V04-stale-accept",
+      "actions": [
+        "propose_revision_2",
+        "accept_revision_1"
+      ],
+      "error": "artifact_identity_mismatch",
+      "owner": "source"
+    },
+    {
+      "id": "V05-concurrent-declarations",
+      "actions": [
+        "propose",
+        "race_accept_decline",
+        "retry_losing_declaration"
+      ],
+      "cas_winners": 1,
+      "recorded_result_stable": true
+    },
+    {
+      "id": "V06-duplicate-propose",
+      "actions": [
+        "propose",
+        "restart",
+        "retry_same_propose"
+      ],
+      "offer_count": 1,
+      "process_count": 1,
+      "bootstrap_attempts": 1,
+      "launch_delta": -1
+    },
+    {
+      "id": "V07-key-conflict",
+      "actions": [
+        "propose",
+        "reuse_key_different_candidate"
+      ],
+      "error": "idempotency_conflict",
+      "new_side_effects": 0
+    },
+    {
+      "id": "V08-bootstrap-uncertain",
+      "actions": [
+        "propose_bootstrap_uncertain",
+        "restart"
+      ],
+      "bootstrap_attempts": 1,
+      "owner": "source",
+      "receiver": "provisional"
+    },
+    {
+      "id": "V09-expiry-before-release",
+      "actions": [
+        "propose",
+        "expire"
+      ],
+      "offer_state": "aborted",
+      "owner": "source",
+      "offer_capabilities": "fenced",
+      "killed_by_expiry": false
+    },
+    {
+      "id": "V10-expiry-after-release",
+      "actions": [
+        "propose",
+        "accept",
+        "release",
+        "expire",
+        "observe_source_fenced",
+        "finalize"
+      ],
+      "offer_state": "active",
+      "owner": "none",
+      "capability": "none",
+      "transfer_delta": -1,
+      "epoch_delta": 1
+    },
+    {
+      "id": "V11-revoke-after-release",
+      "actions": [
+        "propose",
+        "accept",
+        "release",
+        "revoke",
+        "observe_source_fenced",
+        "finalize"
+      ],
+      "owner": "none",
+      "successor_activated": false
+    },
+    {
+      "id": "V12-liveness-unknown",
+      "actions": [
+        "propose",
+        "accept",
+        "release",
+        "observe_liveness_unknown"
+      ],
+      "grant_state": "needs_attention",
+      "owner": "source_fenced",
+      "receiver": "provisional"
+    },
+    {
+      "id": "V13-generation-race",
+      "actions": [
+        "propose",
+        "change_source_generation",
+        "release"
+      ],
+      "error": "generation_superseded",
+      "offer_capabilities": "fenced",
+      "grant_capability": "fenced",
+      "capability_rebound": false
+    },
+    {
+      "id": "V14-artifact-symlink-race",
+      "actions": [
+        "propose_with_symlink_swap"
+      ],
+      "path_escape": false,
+      "unapproved_bytes_read": 0
+    },
+    {
+      "id": "V15-publication-crash",
+      "actions": [
+        "crash_each_publication_boundary",
+        "retry"
+      ],
+      "max_objects": 1,
+      "max_receipts": 1,
+      "unreceipted_projection": false
+    },
+    {
+      "id": "V16-byte-race",
+      "actions": [
+        "concurrent_registrations_at_byte_limit"
+      ],
+      "oversubscribed": false,
+      "max_charge_per_transition": 1
+    },
+    {
+      "id": "V17-missing-object",
+      "actions": [
+        "publish_receipt",
+        "remove_object",
+        "reconcile"
+      ],
+      "offer_state": "failed",
+      "offer_capabilities": "fenced",
+      "cutover": false
+    },
+    {
+      "id": "V18-two-live-offers",
+      "actions": [
+        "race_two_proposals"
+      ],
+      "admitted_offers": 1,
+      "launched_processes": 1
+    },
+    {
+      "id": "V19-cross-domain",
+      "actions": [
+        "propose_cross_domain",
+        "probe_source_and_sibling"
+      ],
+      "visible_domains": [
+        "target"
+      ],
+      "visible_artifacts": [
+        "registered_snapshot"
+      ]
+    },
+    {
+      "id": "V20-capability-direction",
+      "actions": [
+        "receiver_release",
+        "receiver_propose",
+        "owner_question",
+        "owner_accept"
+      ],
+      "rejected_actions": 4,
+      "side_effects": 0
+    },
+    {
+      "id": "V21-content-canary",
+      "actions": [
+        "register_canary_artifacts",
+        "inspect_control_surfaces"
+      ],
+      "semantic_control_bytes": 0
+    },
+    {
+      "id": "V22-restore-fence",
+      "actions": [
+        "restore_live_grant_backup"
+      ],
+      "grant_authority": "invalid",
+      "credential_authority": "invalid",
+      "policy_authority": "invalid",
+      "capability_authority": "invalid"
+    },
+    {
+      "id": "V23-uncertain-credential",
+      "actions": [
+        "release",
+        "observe_source_dead",
+        "observe_credential_unknown"
+      ],
+      "successor_activated": false,
+      "grant_state": "needs_attention"
+    },
+    {
+      "id": "V24-cutover-replay",
+      "actions": [
+        "crash_each_cutover_boundary",
+        "retry"
+      ],
+      "max_transfer_charge": 1,
+      "epoch_delta": 1
+    },
+    {
+      "id": "V25-cross-grant-uniqueness",
+      "actions": [
+        "create_other_nonterminal_grant_participation",
+        "propose_same_candidate"
+      ],
+      "error": "session_already_participating",
+      "launch_delta": 0,
+      "new_side_effects": 0
+    },
+    {
+      "id": "V26-terminal-capability-fence",
+      "actions": [
+        "enter_each_terminal_offer_state"
+      ],
+      "terminal_states_checked": 4,
+      "offer_capabilities": "fenced",
+      "fence_transactional": true
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+# Tutorial feature coverage
+
+The first-project course ends after one explicit native-agent request and the operator’s checks. Explore Deck is optional static help: reading, navigation, and restored progress consume no model usage. Actions described in a lesson remain ordinary, explicit product or CLI actions.
+
+The All lessons catalog separates Get started from Explore Deck. Opening Files, Tasks or Chats hides the tutorial completely — no progress bar or help entry remains in the panel — and closing the panel restores the saved place.
+
+This inventory maps the supported user surfaces to help. Installation-dependent tools are explained with prerequisites; the tutorial does not install them or require them to finish the first project.
+
+| Surface and feature | Help chapter | Behavior and prerequisite | Implementation source |
+| --- | --- | --- | --- |
+| First load, Close, Show tutorial, All lessons, saved position | Finding your way | Close persists dismissal; the global three-dot menu restores progress. | `web/src/app/tutorial.ts`, `tutorial-panel.ts` |
+| Local folder, new directory, repository URL | Projects and sessions | Add project opens an existing or fresh location. Existing directories are not silently overwritten. | `web/src/panels/sidebar/dialogs/add-project.ts` |
+| GitHub import and connection | Projects and sessions | Add project → GitHub → Import from GitHub; search, owner filtering, Import/Open and Refresh. Connect GitHub uses the native CLI and requires authenticated Deck access. Repository access and organization authorization remain GitHub’s decision. | GitHub picker and native connection |
+| Destination, Git identity, clone progress/cancel/partial-copy recovery | Projects and sessions | Review the destination and identity before Clone and add. Cancel import does not imply deletion; use the offered Resume/Discard decision for a partial copy. | `web/src/panels/sidebar/sidebar-dom.ts`, `dialogs/add-project.ts` |
+| Project rename, color, order, expand/collapse and removal | Projects and sessions | Project row menu; removal stops the registered project’s sessions and leaves files on disk. | `web/src/app/session-menu.ts`, `panels/sidebar/sidebar-dom.ts` |
+| New session, provider picker, session rename/color/close | Projects and sessions | Available native CLIs and authentication depend on the installation. Closing ends the process; changing selected sessions is navigation. | `web/src/panels/sidebar/sidebar-dom.ts` |
+| Multiple projects/sessions and worktrees | Projects and sessions; Workflows and integrations | Sessions continue independently. Register linked worktrees explicitly; a repository family shares its Tasks store. A directory is not a confinement boundary. | `web/src/panels/sidebar/dialogs/add-project.ts` |
+| Native input, Copy/Paste, scrollback and live end | The native console | Native CLI owns approvals, slash commands and conversation. An accepted terminal write is not model completion. | `web/src/app/live.ts`, `terminal/attach.ts` |
+| Phone input and soft keys | The native console | The phone input and key row target the selected attached terminal. | `web/src/terminal/soft-keys.ts`, `app/live.ts` |
+| Reconnect, Take control, recovery and uncertain input | Reconnect and recovery | Follow observed session state and explicit recovery controls. Never replay uncertain input automatically. | `web/src/app/recovery.ts`, `app/live.ts` |
+| Files, breadcrumbs, text/image viewing and read-only limits | Files | Files shows the selected project’s working tree; a file viewer is not an editor. | `web/src/panels/files/files-panel-dom.ts` |
+| Upload destination, progress, failure/cancel and file conflicts | Files | Distinguish transferred bytes from server confirmation. Existing file choices are Replace, Upload as or Cancel. Cancel upload applies before confirmation; Stop waiting during confirmation reports Outcome unknown. Dismiss hides the view. Never imply resume offsets or automatic retry. | `web/src/panels/files/` |
+| Tasks board, manual add, status/priority/search/sort/details/dependencies | Tasks | Board reads canonical Tasks state. Reading or tutorial navigation does not change task outcomes. | `web/src/panels/taskmaster/taskmaster-panel-dom.ts` |
+| PRD upload/replacement and task generation | Tasks | Generation is an explicit additional operation and may use provider quota/cost; manual tasks do not require generation. | `web/src/panels/taskmaster/taskmaster-panel.ts` |
+| Preview setup/settings, connection check and Open preview | Project preview | Requires configured preview hosting and a running project server. Reachability is not a test of app correctness. | `web/src/app/project-preview-settings.ts`, `project-preview.ts` |
+| Chats current/earlier/history/details | Chats | Read-only view of supported installed a2a activity. Chat creation and replies stay in the native integration. | `web/src/panels/chats/chats-panel-dom.ts` |
+| Terminal font, themes/custom colors, project colors | Appearance and navigation | Presentation preferences do not modify native conversation or project source. | `web/src/app/session-menu.ts`, `terminal/themes.ts` |
+| Sidebar, info bar, mouse/keyboard hints and shortcuts | Appearance and navigation | Use the menu’s platform-specific shortcuts; do not advertise browser-reserved bindings. | `web/src/app/shortcuts.ts`, `lib/hints.ts` |
+| Native subscription login, Codex login helper and Finish harness login | Login and security; Prepare your console (first project) | Codex signs in from the same terminal: the helper is offered on attach for a server-flagged Codex session on every creation path (sidebar, tutorial connect, recovery Start fresh session); if OpenAI returns to a localhost error page, copy the entire return-tab address and paste it only into the helper; Use terminal instead closes it, Open login helper brings it back. Other supported localhost-callback logins paste only the callback URL via Finish harness login. Browser Sign out is separate from provider authentication. | `web/src/app/live.ts`, `harness-login-coordinator.ts`, `harness-login.ts`, `tutorial-project-view.ts`, `tutorial-explore.ts` |
+| Global/project Git identities versus GitHub authentication | Login and security | Commit author identity is separate from repository access credentials. | `web/src/panels/sidebar/sidebar-dom.ts` |
+| Yolo mode and close/remove confirmations | Login and security | Explain effects; never change safety/confirmation preferences as a tutorial step. | `web/src/app/session-menu.ts` |
+| Sign out, optional workspace lock and unlock methods | Login and security | Lock/unlock controls exist only in configured installations. Sign out leaves sessions running; the offered workspace lock stops sessions and locks storage. | `web/src/app/security/`, `session-menu.ts` |
+| Native Git/GitHub PR workflow and independent review | Workflows and integrations | Use configured native tools explicitly. Same-agent review is not independent formal approval; opening or merging a PR is never tutorial automation. | Installed `git`/`gh` tools |
+| MemPalace and a2a integrations | Workflows and integrations | Available only when installed/configured. Memory search/checkpoint and agent chat have explicit scope; no automatic mining or mandatory integration setup. | `README.md`, `docs/a2a-chat.md`, installation configuration |
+
+## Verification
+
+The Explore browser probe must visit every optional chapter with keyboard and phone layouts, exercise Close/Show and reload persistence, and demonstrate that opening Files, Tasks or Chats hides every tutorial surface while closing the panel restores the saved progress. It must reject project/session/credential mutations and terminal input caused by static help navigation. The first-project model tests must prove Finish dismisses at the course boundary instead of advancing into optional help.
+
+This table is not evidence of operator qualification, a paid-provider run, installation-specific integration availability, or a formal review. Those gates remain separate.
