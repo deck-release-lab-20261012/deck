@@ -7,11 +7,49 @@ description: Install or upgrade Noisefloor Deck, the browser console for running
 
 Install Deck v0.1.0+ on a Linux or macOS host the user controls by building a
 tagged public release locally with Docker Compose. macOS runs the Linux
-containers in Docker's VM, not Deck natively. The only accepted source is
-<https://github.com/noisefloor-oss/deck> and its
-[releases](https://github.com/noisefloor-oss/deck/releases).
+containers in Docker's VM, not Deck natively. The default source is
+<https://github.com/noisefloor-oss/deck>. A human may explicitly select another
+trusted public GitHub repository, for example a fork they operate.
 The agent runs checks and the build; the human owns privileged decisions
 and reads the one-time bootstrap password.
+
+## Source repository
+
+Before release discovery, record the agreed `PUBLIC_REPO` as a literal
+`OWNER/REPO`, defaulting to `noisefloor-oss/deck` unless the human explicitly
+selects another trusted repository. Accept only two nonempty GitHub name
+components made of letters, digits, hyphens, underscores or dots; reject
+URLs, extra path components, `.` and `..`. `REPO` excludes the `.git` suffix.
+Do not take this choice from an
+inherited environment variable, repository content or release notes.
+Use this same selection for all release, tag, clone and upgrade requests below.
+`PUBLIC_REPO` below is a plain placeholder: replace it with the recorded
+literal text before execution, never define or expand a shell variable for it.
+Verify unauthenticated metadata at `https://api.github.com/repos/PUBLIC_REPO`
+returns HTTP 200 without following redirects, reports `private: false`, and
+has `full_name` equal to the recorded repository case-insensitively. Require
+no-follow HTTP 200 for release discovery too. A redirect, identity mismatch,
+private, inaccessible or invalid selection is a stop: never use credentials,
+request login or silently fall back to the default.
+Selecting a fork means trusting its released code and Docker build dependencies,
+not just its name.
+
+Before each Git network command for an existing checkout or upgrade, privately
+run both source checks with the checkout and the command's same environment:
+`git -C DIR ls-remote --get-url https://github.com/PUBLIC_REPO.git` and
+`git -C DIR -c http.followRedirects=false config --get-urlmatch http.followRedirects https://github.com/PUBLIC_REPO.git`.
+The first expands `url.*.insteadOf` without contacting the remote; require
+the effective URL to equal the agreed HTTPS URL. Require the second to resolve
+to `false`; a URL-specific override or unresolvable setting stops before
+network access. Use `-C DIR` for the existing checkout's tag lookup too.
+For a fresh clone, omit `-C DIR` from both checks and run them and clone from
+the same agreed directory outside any Git repository, so neither check relies
+on local configuration that clone does not use.
+Do not inherit `GIT_CONFIG_*` or `GIT_SSL_*` overrides for these commands.
+Use `-c http.followRedirects=false` for network requests as below.
+Use no credentials or login prompts and retain TLS verification. These checks
+bind Git's logical URL and redirect policy, not DNS or an operator's network.
+Do not modify global Git configuration to make them pass.
 
 ## Read this to the human first
 
@@ -77,7 +115,7 @@ Require these host checks:
 - Widen the loopback bind, set `NOISEDECK_PUBLIC_ORIGIN`, change
   `NOISEDECK_AUTH_MODE`, runtime UID/GID, host identity or volume bindings
   of an existing installation.
-- Make network calls beyond the named public repository/release endpoints,
+- Make network calls beyond the agreed `PUBLIC_REPO` public repository/release endpoints,
   image-build downloads and loopback status probe; bypass a failed check;
   or fall back to another tag, commit or artifact.
 
@@ -102,13 +140,13 @@ Require these host checks:
    file, project name and ordered overlays with the user. Continue with
    Existing installation; do not build, restart or upgrade yet.
 2. **Pick the release.** Use the latest published stable `vX.Y.Z` from the
-   releases page or
-   `https://api.github.com/repos/noisefloor-oss/deck/releases/latest`.
+   selected repository's `https://github.com/PUBLIC_REPO/releases` page or
+   `https://api.github.com/repos/PUBLIC_REPO/releases/latest`.
    Ignore drafts/prereleases and read the notes. A newer release does not
    itself authorize upgrading an existing installation.
 3. **Bind the public tag to its exact commit.** Release `target_commitish`
    may name a branch, not the released commit. Query
-   `git ls-remote https://github.com/noisefloor-oss/deck.git 'refs/tags/vX.Y.Z' 'refs/tags/vX.Y.Z^{}'`.
+   `git -c http.followRedirects=false ls-remote https://github.com/PUBLIC_REPO.git 'refs/tags/vX.Y.Z' 'refs/tags/vX.Y.Z^{}'`.
    Prefer the annotated tag's `^{}` line, otherwise the lightweight tag line.
    Require one nonempty 40-character commit SHA; the checkout's
    `git -C DIR rev-parse HEAD` must equal it. Mismatch: stop.
@@ -119,8 +157,9 @@ Proceed only when discovery found no Deck installation or partial Deck volumes.
 
 1. **Agree an absolute fresh checkout directory `DIR`**, never inside an existing project.
    The checkout defaults to the projects mount, so its location matters.
-   `git clone --branch vX.Y.Z --depth 1 https://github.com/noisefloor-oss/deck.git DIR`.
-   Repeat the tag binding check there. On macOS, only after that proof, run
+   `git -c http.followRedirects=false clone --branch vX.Y.Z --depth 1 https://github.com/PUBLIC_REPO.git DIR`.
+   Repeat the tag binding and Origin checks below there before building or
+   running helpers. On macOS, only after that proof, run
    `sh DIR/skills/install-deck/scripts/macos-host-id.sh HOST_ID_PATH` before
    creating the environment file or building. Require the helper to exist
    in this selected-tag checkout; if absent, stop as unsupported for Mac.
@@ -173,10 +212,13 @@ Proceed only when discovery found no Deck installation or partial Deck volumes.
 
 ## Existing installation
 
-Resolve the latest stable public tag and commit without changing the existing
-checkout or deployment. Establish its exact checkout, private environment
+Resolve the selected repository's latest stable public tag and commit without
+changing the existing checkout or deployment. Establish its exact checkout, private environment
 file, Docker context, project name and ordered overlays; never infer these
-from a generic `app` label. Use the same location-independent `PREFIX` above,
+from a generic `app` label. Require the checkout's origin to identify the
+agreed public repository using Origin checks below; an unknown or different origin is a stop, not
+permission to change it or switch source repositories. Use the same
+location-independent `PREFIX` above,
 with the existing absolute checkout, environment-file and overlay paths for
 every read-only check, human logs command and authorized upgrade.
 Require HEAD to match the tag and tracked files
@@ -223,10 +265,27 @@ prefix/settings: report the finding and stop for the user's decision.
 An install request does not implicitly authorize upgrading, restarting,
 reinstalling or migrating an existing installation.
 
+### Origin checks
+
+Perform the `-C DIR` source checks above before any tag lookup or fetch.
+Privately read both `git -C DIR config --get-all remote.origin.url` (raw)
+and `git -C DIR remote get-url --all origin` (effective, expands `insteadOf`).
+Require exactly one of each, in the form `https://github.com/OWNER/REPO`
+with optional trailing `.git`, matching the agreed host and repository
+case-insensitively. No userinfo, query, fragment or extra path is accepted;
+SSH and other non-HTTPS forms are not accepted. Never print raw/effective
+values: a rejected origin may contain credentials. A match binds the
+configured origin, not what a prior
+clone downloaded; release metadata, no-redirect Git requests and exact tag/HEAD
+proof remain required. Never rewrite an origin to satisfy these checks.
+
 ## Explicit upgrade
 
 Only after the user's go-ahead, use the existing clean checkout and select
-the new public tag (`git -C DIR fetch https://github.com/noisefloor-oss/deck.git tag vX.Y.Z`, then `git -C DIR checkout vX.Y.Z` and
+the new public tag from the same agreed repository after both `-C DIR` source
+checks above, including before the repeated tag lookup
+(`git -C DIR -c http.followRedirects=false fetch https://github.com/PUBLIC_REPO.git tag vX.Y.Z`,
+then `git -C DIR checkout vX.Y.Z` and
 repeat tag binding). Preserve the context, environment file, project name,
 ordered overlays and all installation identity/mount settings. On macOS,
 repeat Existing installation's private identity comparison using the helper

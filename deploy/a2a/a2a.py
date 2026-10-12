@@ -185,17 +185,23 @@ PAGE = 500
 # on-disk mirror below. Long-running loops never enable it — the
 # courier's and wait's whole job is seeing what arrives next.
 _EVENTS_SNAPSHOT: dict | None = None
+# The derived placement state serves one derivation per snapshot; see the
+# derived presence state section below.
+_PRESENCE_STATE_MEMO: dict = {"derived": None, "at": 0.0}
 
 
 def snapshot_events() -> None:
     """List each room once until release_events; for one-shot reads."""
     global _EVENTS_SNAPSHOT
     _EVENTS_SNAPSHOT = {}
+    _PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
 
 
 def release_events() -> None:
+    """Read live again."""
     global _EVENTS_SNAPSHOT
     _EVENTS_SNAPSHOT = None
+    _PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
 
 
 def list_events(**filters) -> list[dict]:
@@ -222,8 +228,19 @@ def _read_events(filters: dict) -> list[dict]:
         # touch the disk cache; only one-shot reads (snapshot mode) do.
         return _paged_events(filters)
     cache = _EventsCache(filters)
-    events = cache.read()
-    cursor = events[-1]["id"] if events else None
+    doc = cache.read_doc()
+    events = doc["events"] if doc else []
+    tip = (doc or {}).get("tip") or {}
+    tip_id = tip.get("id") if isinstance(tip, dict) else tip
+    if cache.keep_from is not None and any(str(e.get("created_at") or "") < cache.keep_from for e in events):
+        # A retention-bounded mirror only shrinks when something is written;
+        # with no delta this read is the one chance to drop what the
+        # retention outlived. The relay tip is kept beside the events, not
+        # derived from their last survivor, so trimming every retained row
+        # still resumes from the tip instead of re-reading history.
+        events = [e for e in events if str(e.get("created_at") or "") >= cache.keep_from]
+        cache.write(events, tip=tip)
+    cursor = tip_id or (events[-1]["id"] if events else None)
     try:
         delta = _paged_events(filters, since=cursor)
     except LogstreamError:
@@ -234,10 +251,10 @@ def _read_events(filters: dict) -> list[dict]:
         delta = None
     if delta is None:
         events = _paged_events(filters)
-        cache.replace(events)
+        cache.replace(events, tip={"id": events[-1]["id"], "seq": events[-1].get("seq")} if events else None)
     elif delta:
         events.extend(delta)
-        cache.write(events)
+        cache.write(events, tip={"id": delta[-1]["id"], "seq": delta[-1].get("seq")})
     return events
 
 
@@ -274,6 +291,22 @@ def _paged_events(filters: dict, since: str | None = None) -> list[dict]:
         _ORDER_REFUSED = False  # ask once more; a relay that still refuses and still misorders raises below
         return _pages_in_order(dict(filters))
 
+def _paged_events_relaxed(filters: dict, since: str | None) -> list[dict]:
+    """A listing from a caller-held cursor, surviving a reset palace: the
+    relay refuses a cursor it no longer knows, and a reader's only honest
+    fallback is the whole room, from which its cursor is re-derived. The
+    ack trail lives on the relay too, so after a reset everything reads
+    as unread — the true state of a reset world."""
+    if since is None:
+        return _paged_events(dict(filters))
+    try:
+        return _paged_events(dict(filters), since=since)
+    except LogstreamError as exc:
+        if not _cursor_refused(exc):
+            raise
+        return _paged_events(dict(filters))
+
+
 
 def _pages_in_order(filters: dict) -> list[dict]:
     events: list[dict] = []
@@ -309,48 +342,523 @@ class _EventsCache:
         self.key = json.dumps([MCP_URL, sorted(filters.items())])
         digest = hashlib.sha256(self.key.encode()).hexdigest()[:40]
         self.path = _state_path(f"events-cache-{digest}.json")
-
+        # Presence alone is retention-bounded: the roster folds nothing
+        # older than its horizon, so the mirror keeps a little past that
+        # and drops the rest. Chat history is permanent and stays whole.
+        self.keep_from = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 2 * PRESENCE_TTL_S)
+        ) if filters.get("room") == ROOM_PRESENCE and "type" not in filters else None
     def read(self) -> list[dict]:
+        return self.read_doc()["events"] if self.read_doc() else []
+
+    def read_doc(self) -> dict | None:
         try:
             doc = json.loads(self.path.read_text())
         except (OSError, ValueError):
-            return []
+            return None
         if not isinstance(doc, dict) or doc.get("key") != self.key or not isinstance(doc.get("events"), list):
-            return []
-        return doc["events"]
+            return None
+        tip = doc.get("tip")
+        if isinstance(tip, str):
+            # Old mirrors stored a bare id: its event, if still retained,
+            # names the sequence; a tip older than every retained row keeps
+            # the oldest row's sequence, which only under-fetches nothing.
+            seq = next((e.get("seq") for e in reversed(doc["events"]) if e.get("id") == tip), None)
+            if seq is None and doc["events"]:
+                seq = doc["events"][0].get("seq")
+            doc["tip"] = {"id": tip, "seq": seq}
+        elif not isinstance(tip, dict):
+            doc["tip"] = {"id": doc["events"][-1]["id"] if doc["events"] else None,
+                          "seq": doc["events"][-1].get("seq") if doc["events"] else None}
+        return doc
 
     # Both writes go through the lock. write merges what is on disk now:
     # two processes listing at once each fetch their own delta, and the
     # merge keeps every fetched event whichever of them writes last.
     # Events are deduplicated by id and keep append order.
-    def write(self, events: list[dict]) -> None:
+    def write(self, events: list[dict], tip: str | None = None) -> None:
         def fold(current: list[dict]) -> list[dict]:
             seen = {e.get("id") for e in current}
-            return current + [e for e in events if e.get("id") not in seen]
+            kept = current + [e for e in events if e.get("id") not in seen]
+            if self.keep_from is not None:
+                kept = [e for e in kept if str(e.get("created_at") or "") >= self.keep_from]
+            return kept
 
-        self._store(fold)
+        def merge_tip(doc: dict | None):
+            # The tip merges by the relay's append sequence, never by the
+            # event id's timestamp: a peer's late replication appends older
+            # timestamps after newer local events, and the relay resolves
+            # since_event_id by row, not by clock.
+            stored = (doc or {}).get("tip") or {}
+            seq_of = lambda t: t.get("seq") if isinstance(t, dict) and isinstance(t.get("seq"), int) else -1
+            return tip if seq_of(tip) >= seq_of(stored) else stored
+
+        self._store(fold, merge_tip)
 
     # replace is the rebuild after the relay refused the cached cursor:
     # the palace holds nothing the mirror remembers, so merging would
     # resurrect events that palace no longer has.
-    def replace(self, events: list[dict]) -> None:
-        self._store(lambda current: list(events))
+    def replace(self, events: list[dict], tip: str | None = None) -> None:
+        if self.keep_from is not None:
+            events = [e for e in events if str(e.get("created_at") or "") >= self.keep_from]
+        self._store(lambda current: list(events), lambda doc: tip)
 
-    def _store(self, fold) -> None:
+    def _store(self, fold, tip_of=lambda doc: None) -> None:
         lock_path = self.path.with_suffix(".lock")
         try:
             with open(lock_path, "a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 try:
-                    merged = fold(self.read())
+                    doc = self.read_doc()
+                    merged = fold((doc or {}).get("events") or [])
+                    tip = tip_of(doc)
+                    if tip is None:
+                        tip = {"id": merged[-1]["id"], "seq": merged[-1].get("seq")} if merged else (doc or {}).get("tip")
                     temporary = self.path.with_suffix(".tmp")
-                    temporary.write_text(json.dumps({"key": self.key, "events": merged}))
+                    temporary.write_text(json.dumps({"key": self.key, "tip": tip, "events": merged}))
                     temporary.chmod(0o600)
                     temporary.replace(self.path)
                 finally:
                     fcntl.flock(lock, fcntl.LOCK_UN)
         except OSError:
             pass  # the cache is an accelerator; a listing never fails over it
+
+# ── Derived presence state ──────────────────────────────────────────────────
+# Placement memory is forever — a handle's host is remembered from the first
+# host that vouched for it, however long ago — while the room itself only
+# needs the roster's horizon. Rather than re-folding every presence event
+# ever written on every cold command, the client retains, per handle and
+# host, the earliest and the latest verifiable-shaped row (and per host the
+# earliest and latest courier scan), and derives placement from them fresh
+# each serve under the keys that exist then. A vouch is a fact about the
+# keys room: rows are re-judged when keys arrive, never frozen at fold
+# time, and a signature-shaped forgery simply never judges true. Because
+# retention keeps the earliest row per host, arbitrary replay order and
+# concurrent writers merge to the same state as one ordered whole fold.
+
+
+def _cursor_refused(exc: LogstreamError) -> bool:
+    """Only the relay's own refusal of this cursor means a reset palace;
+    downtime or a broken endpoint is never that."""
+    message = str(exc)
+    return "since_event_id" in message and "not found" in message
+
+
+def _retained_row(event: dict, fields: dict) -> dict | None:
+    """One presence row with everything its re-judgment needs: the writer
+    (a copied row under a foreign writer is a claim, never a vouch), the
+    signature shape, and the signed envelope."""
+    meta = metadata_of(event)
+    at = fields.get("at")
+    return {
+        "seq": event.get("seq"),
+        "writer": event.get("from_agent") or "",
+        "host": str(fields.get("host") or ""),
+        "kind": event["type"],
+        "fields": {k: v for k, v in fields.items()},
+        "sig": meta.get("sig") if isinstance(meta.get("sig"), str) else "",
+        "signed_shape": (isinstance(fields.get("host"), str) and fields["host"]
+                         and isinstance(meta.get("sig"), str)
+                         and isinstance(at, (int, float)) and not isinstance(at, bool)
+                         and isinstance(fields.get("nonce"), str)),
+        "agents": ([a for a in fields.get("agents") if isinstance(a, dict)]
+                   if event["type"] == "courier.scan" and isinstance(fields.get("agents"), list) else None),
+    }
+
+
+def _fold_presence(maps: dict, triples: list[tuple[dict, dict, bool]]) -> None:
+    """Retain rows verbatim; judgment and pruning happen at serve. Rows are
+    kept per named handle (and per writer, for claims), and courier scans
+    per host, so whatever keys arrive the whole fold's outcome stays
+    reachable from what is retained."""
+    for event, fields, _vouched in triples:
+        seq = event.get("seq")
+        if not isinstance(seq, int):
+            continue
+        row = _retained_row(event, fields)
+        if row is None:
+            continue
+        if event["type"] == "courier.scan":
+            scans = maps["scans"].setdefault(row["host"], {})
+            scans[str(seq)] = row
+            continue
+        named = fields.get("handle")
+        if isinstance(named, str) and named:
+            maps["rows"].setdefault(named, {})[str(seq)] = row
+        who = event.get("from_agent")
+        if isinstance(who, str) and who and who != named:
+            maps["rows"].setdefault(who, {})[str(seq)] = row
+
+
+def _judge_row(row: dict, keys_of: dict) -> bool | None:
+    """True, false, or None when the host's key is not verifiable here and
+    the verdict can still change. Eligibility is the original fold's: the
+    writer must be the identity the signature covers, and the signature
+    shape must hold; only then does the key judge it."""
+    if not row["signed_shape"]:
+        return False
+    signed_for = f"courier@{row['host']}" if row["kind"] == "courier.scan" else row["fields"].get("handle")
+    if not row["writer"] or row["writer"] != signed_for:
+        return False
+    host = row["host"]
+    if host not in keys_of:
+        try:
+            keys_of[host] = verify_keys_of(host)
+        except LogstreamError:
+            keys_of[host] = []
+    if not keys_of[host]:
+        return None  # no verifiable key here (yet): the verdict can change
+    envelope = {"kind": row["kind"], **row["fields"]}
+    return host_vouches(host, row["sig"], envelope, keys_of[host])
+
+
+def _derive_newer(map_, key, value, rank) -> None:
+    current = map_.get(key)
+    if current is None or rank >= current[1]:
+        map_[key] = (value, rank)
+
+
+def _judge_rows(maps: dict) -> list[tuple[int, dict]]:
+    """All retained rows in relay order with their verdicts set: True, False,
+    or None when no verifiable key for the host exists here yet. A False
+    verdict is not permanent — pins are added over time and a host may hold
+    several — so only True rows are ever pruning candidates."""
+    keys_of: dict[str, list[bytes]] = {}
+    ordered: list[tuple[int, dict]] = []
+    for host, scans in maps["scans"].items():
+        for _seq, row in scans.items():
+            ordered.append((row["seq"], row))
+    for _handle, rows in maps["rows"].items():
+        for _seq, row in rows.items():
+            ordered.append((row["seq"], row))
+    ordered.sort(key=lambda item: item[0])
+    for _seq, row in ordered:
+        row["verdict"] = _judge_row(row, keys_of)
+    return ordered
+
+
+def _derive_presence(maps: dict) -> dict:
+    """Placement from the retained rows under the keys that exist now, in
+    relay order — the same result as folding the whole room at this
+    moment."""
+    out = {"hosts": {}, "auth": {}, "projects": {}, "sessions": {},
+           "names": {}, "harness": {}, "session_handle": {}}
+    ordered = _judge_rows(maps)
+
+    def remember_project(handle: str, host: str, at: float, metadata: dict) -> None:
+        if out["auth"].get(handle, ("", 0))[0] != host:
+            return
+        scope = _project_scope(metadata.get("project_id"), metadata.get("project_name"))
+        session = metadata.get("deck_session")
+        session_key = f"{host}\x1f{session}" if isinstance(session, str) and session_label_file(session) else None
+        if session_key is not None:
+            _derive_newer(out["sessions"], session_key, scope, at)
+        _derive_newer(out["projects"], handle, (scope, session_key), at)
+        if scope is not None:
+            _derive_newer(out["names"], scope["project_id"], scope, at)
+
+    for seq, row in ordered:
+        verdict = row["verdict"]
+        if row["kind"] == "courier.scan":
+            if verdict is not True:
+                continue
+            fields = dict(row["fields"])
+            fields["agents"] = row["agents"] or []
+            for agent in _scan_agents(fields, True):
+                handle = agent.get("handle")
+                if isinstance(handle, str) and handle:
+                    out["hosts"][handle] = agent.get("host")
+                    current = out["auth"].get(handle)
+                    if current is None or seq < current[1]:
+                        out["auth"][handle] = (agent.get("host") or row["host"], seq)
+                    remember_project(handle, row["host"], fields.get("at", 0), agent)
+            continue
+        named = row["fields"].get("handle")
+        if isinstance(named, str) and named:
+            out["hosts"][named] = row["host"]
+        who = row["writer"]
+        if who and who != named:
+            out["hosts"][who] = row["host"]
+        if not (isinstance(named, str) and named):
+            continue
+        session = row["fields"].get("deck_session")
+        if isinstance(session, str) and session:
+            _derive_newer(out["session_handle"], session, named, seq)
+        if verdict is True:
+            current = out["auth"].get(named)
+            if current is None or seq < current[1]:
+                out["auth"][named] = (row["host"], seq)
+            if row["fields"].get("harness"):
+                _derive_newer(out["harness"], named, row["fields"]["harness"], seq)
+            remember_project(named, row["host"], row["fields"].get("at", 0), row["fields"])
+
+    _prune_retention(maps, ordered)
+    return {
+        "hosts": out["hosts"],
+        "auth": out["auth"],
+        "harness": {k: v[0] for k, v in out["harness"].items()},
+        "session_handle": {k: v[0] for k, v in out["session_handle"].items()},
+        "names": {k: v[0] for k, v in out["names"].items()},
+        "projects": {k: (v[0][0], v[0][1], v[1]) for k, v in out["projects"].items()},
+        "sessions": dict(out["sessions"]),
+    }
+
+
+def _prune_retention(maps: dict, ordered: list[tuple[int, dict]]) -> None:
+    """Keep exactly what any future fold could still read.
+
+    A row whose verdict is not True keeps its whole body: no verifiable key
+    for its host exists here yet, or it failed against the keys that do,
+    and pins are added over time — a host may hold several — so its
+    verdict can still change either way. A True row is kept only where it
+    wins some exported map's fold, and each map ranks its own way:
+
+    - claims (hosts) and session naming: the newest row of any verdict by
+      relay sequence, per handle and per session value;
+    - ownership (auth): the earliest True row per handle;
+    - harness: the newest True row that names one, by sequence;
+    - placement (projects, sessions, names): the newest True row by signed
+      moment, per handle-and-host — the derive gates placement on the
+      first-vouch owner's host, so each host's winner is kept and a late
+      pin that changes ownership finds its rows whole;
+    - scans: the newest per host by sequence, and per agent the earliest
+      True vouch plus the newest by sequence and by signed moment.
+
+    Winners are registered in the bucket the row actually lives in — its
+    handle's, its writer's, or its scan host's — so a row kept for one
+    map's sake is never deleted for living under another map's key.
+    """
+    rows_keep: dict[str, set[str]] = {}
+    scans_keep: dict[str, set[str]] = {}
+
+    def win_row(handle: str, row: dict) -> None:
+        if isinstance(handle, str) and handle:
+            rows_keep.setdefault(handle, set()).add(str(row["seq"]))
+
+    def win_scan(host: str, row: dict) -> None:
+        if isinstance(host, str) and host:
+            scans_keep.setdefault(host, set()).add(str(row["seq"]))
+
+    latest_claim: dict[str, dict] = {}
+    latest_session_name: dict[str, tuple[dict, str]] = {}
+    earliest_vouch: dict[str, dict] = {}
+    latest_harness: dict[str, dict] = {}
+    latest_placement: dict[tuple, dict] = {}  # (handle, host) -> row, by moment
+    latest_session_placement: dict[tuple, dict] = {}  # (handle, host, session) -> row, by moment
+    latest_name: dict[tuple, dict] = {}       # (project, handle, host) -> row
+    latest_scan_host: dict[str, dict] = {}
+    agent_first: dict[tuple, dict] = {}
+    agent_newest_seq: dict[tuple, dict] = {}
+    agent_newest_at: dict[tuple, dict] = {}
+
+    def rank_of(row: dict) -> float:
+        at = row["fields"].get("at")
+        return at if isinstance(at, (int, float)) and not isinstance(at, bool) else float(row["seq"])
+
+    for seq, row in ordered:
+        if row["kind"] == "courier.scan":
+            if row["host"] not in latest_scan_host or seq >= latest_scan_host[row["host"]]["seq"]:
+                latest_scan_host[row["host"]] = row
+            if row["verdict"] is not True:
+                continue
+            fields = dict(row["fields"])
+            fields["agents"] = row["agents"] or []
+            at = rank_of(row)
+            for agent in _scan_agents(fields, True):
+                handle = agent.get("handle")
+                if not (isinstance(handle, str) and handle):
+                    continue
+                key = (row["host"], handle)
+                if key not in agent_first:
+                    agent_first[key] = row
+                if key not in agent_newest_seq or seq >= agent_newest_seq[key]["seq"]:
+                    agent_newest_seq[key] = row
+                if key not in agent_newest_at or at >= rank_of(agent_newest_at[key]):
+                    agent_newest_at[key] = row
+                # The derive folds each vouched agent as a claim, a possible
+                # first vouch, and placement metadata of its own.
+                if handle not in latest_claim or seq >= latest_claim[handle]["seq"]:
+                    latest_claim[handle] = row
+                if handle not in earliest_vouch:
+                    earliest_vouch[handle] = row
+                hkey = (handle, row["host"])
+                if hkey not in latest_placement or at >= rank_of(latest_placement[hkey]):
+                    latest_placement[hkey] = row
+                scope = _project_scope(agent.get("project_id"), agent.get("project_name"))
+                if scope is not None:
+                    nkey = (scope["project_id"], handle, row["host"])
+                    if nkey not in latest_name or at >= rank_of(latest_name[nkey]):
+                        latest_name[nkey] = row
+                session = agent.get("deck_session")
+                if isinstance(session, str) and session:
+                    skey = (handle, row["host"], session)
+                    if skey not in latest_session_placement or at >= rank_of(latest_session_placement[skey]):
+                        latest_session_placement[skey] = row
+            continue
+        named = row["fields"].get("handle")
+        for key in (named, row["writer"]):
+            if isinstance(key, str) and key:
+                if key not in latest_claim or seq >= latest_claim[key]["seq"]:
+                    latest_claim[key] = row
+        session = row["fields"].get("deck_session")
+        if isinstance(named, str) and named and isinstance(session, str) and session:
+            if session not in latest_session_name or seq >= latest_session_name[session][0]["seq"]:
+                latest_session_name[session] = (row, named)
+        if row["verdict"] is not True or not (isinstance(named, str) and named):
+            continue
+        if named not in earliest_vouch:
+            earliest_vouch[named] = row
+        if row["fields"].get("harness"):
+            if named not in latest_harness or seq >= latest_harness[named]["seq"]:
+                latest_harness[named] = row
+        at = rank_of(row)
+        key = (named, row["host"])
+        if key not in latest_placement or at >= rank_of(latest_placement[key]):
+            latest_placement[key] = row
+        if isinstance(session, str) and session:
+            skey = (named, row["host"], session)
+            if skey not in latest_session_placement or at >= rank_of(latest_session_placement[skey]):
+                latest_session_placement[skey] = row
+        scope = _project_scope(row["fields"].get("project_id"), row["fields"].get("project_name"))
+        if scope is not None:
+            nkey = (scope["project_id"], named, row["host"])
+            if nkey not in latest_name or at >= rank_of(latest_name[nkey]):
+                latest_name[nkey] = row
+
+    # Winner tables built; registration follows. A vouched scan agent
+    # folded into a table registers in its scan bucket, an ordinary row in
+    # its handle's and writer's.
+
+    def register(row: dict, *handles: str) -> None:
+        # A winner lives in exactly one bucket: its scan host's when it came
+        # from a scan agent, its handle's and writer's otherwise. Registering
+        # in the wrong bucket would delete the row it was kept for.
+        if row["kind"] == "courier.scan":
+            win_scan(row["host"], row)
+            return
+        for handle in handles:
+            win_row(handle, row)
+        win_row(row["writer"], row)
+
+    for handle, row in latest_claim.items():
+        register(row, handle)
+    for (row, handle) in latest_session_name.values():
+        register(row, handle)
+    for handle, row in earliest_vouch.items():
+        register(row, handle)
+    for handle, row in latest_harness.items():
+        register(row, handle)
+    for (handle, _host), row in latest_placement.items():
+        register(row, handle)
+    for (handle, _host, _session), row in latest_session_placement.items():
+        register(row, handle)
+    for (_project, handle, _host), row in latest_name.items():
+        register(row, handle)
+    for host, row in latest_scan_host.items():
+        win_scan(host, row)
+    for table in (agent_first, agent_newest_seq, agent_newest_at):
+        for (_host, _handle), row in table.items():
+            win_scan(row["host"], row)
+
+    for handle, rows in maps["rows"].items():
+        keep = rows_keep.get(handle, set())
+        maps["rows"][handle] = {s: row for s, row in rows.items() if row.get("verdict") is not True or s in keep}
+    for host, scans in maps["scans"].items():
+        keep = scans_keep.get(host, set())
+        maps["scans"][host] = {s: row for s, row in scans.items() if row.get("verdict") is not True or s in keep}
+
+
+def _presence_state_refresh() -> dict:
+    """The derived placement, current to the relay's tip. One delta pass per
+    one-shot command: within a snapshot the derivation is served, and the
+    hosts cache's own brief TTL bounds the readers that follow."""
+    if _PRESENCE_STATE_MEMO["derived"] is not None and _EVENTS_SNAPSHOT is not None:
+        return _PRESENCE_STATE_MEMO["derived"]
+    base = {"room": ROOM_PRESENCE, "stream": STREAM, "limit": PAGE}
+    path = _state_path("presence-state.json")
+    doc = _presence_state_read(path)
+    maps: dict | None = None
+    if doc is not None:
+        maps, tip = doc["maps"], doc.get("tip") or {}
+        if isinstance(tip.get("id"), str) and tip["id"]:
+            try:
+                delta = _paged_events(dict(base), since=tip["id"])
+                if delta:
+                    _fold_presence(maps, _presence_triples(delta))
+                    maps["tip"] = {"id": delta[-1]["id"], "seq": delta[-1].get("seq")}
+            except LogstreamError as exc:
+                if not _cursor_refused(exc):
+                    raise  # downtime is not a reset: propagate, keep the state
+                maps = None  # the relay refused this tip: rebuild whole
+        else:
+            maps = None
+    if maps is None:
+        maps = {"rows": {}, "scans": {}}
+        triples = _presence_triples(_paged_events(dict(base)))
+        _fold_presence(maps, triples)
+        _derive_presence(maps)  # judges and prunes what was just folded
+        tip = {"id": triples[-1][0]["id"], "seq": triples[-1][0].get("seq")} if triples else {}
+        reconciled = _presence_state_store(path, maps, tip, replace=True)
+        derived = _derive_presence(reconciled)
+        _PRESENCE_STATE_MEMO.update(derived=derived, at=time.perf_counter())
+        return derived
+    _derive_presence(maps)  # judge the delta, prune, then persist the union
+    reconciled = _presence_state_store(path, maps, maps.get("tip") or tip)
+    derived = _derive_presence(reconciled)
+    _PRESENCE_STATE_MEMO.update(derived=derived, at=time.perf_counter())
+    return derived
+
+
+def _presence_state_read(path) -> dict | None:
+    try:
+        doc = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict) or doc.get("url") != MCP_URL or not isinstance(doc.get("maps"), dict):
+        return None
+    if set(doc["maps"]) - {"rows", "scans"} or not {"rows", "scans"} <= set(doc["maps"]):
+        return None
+    if doc.get("schema") != 2:
+        return None  # an older retention format: rebuild whole
+    return doc
+
+
+def _presence_state_store(path, maps: dict, tip: dict, replace: bool = False) -> dict | None:
+    """Persist the state under the lock. Concurrent writers union first —
+    rows are immutable and keyed by relay sequence — and the union is then
+    judged and pruned before it is written, so the disk state stays bounded
+    however many writers race. Returns the reconciled maps so the caller's
+    derivation includes rows another process had already stored."""
+    lock_path = path.with_suffix(".lock")
+    merged = None
+    try:
+        with open(lock_path, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                doc = None if replace else _presence_state_read(path)
+                if doc is not None:
+                    merged = doc["maps"]
+                    for section in ("rows", "scans"):
+                        for key, entries in maps.get(section, {}).items():
+                            target = merged[section].setdefault(key, {})
+                            for seq, row in entries.items():
+                                target.setdefault(seq, row)
+                    stored = doc.get("tip") or {}
+                    if isinstance(stored.get("seq"), int) and isinstance(tip.get("seq"), int) and stored["seq"] > tip["seq"]:
+                        tip = stored
+                else:
+                    merged = {k: v for k, v in maps.items() if k != "tip"}
+                _prune_retention(merged, _judge_rows(merged))
+                persisted = {k: v for k, v in merged.items() if k != "tip"}
+                temporary = path.with_suffix(".tmp")
+                temporary.write_text(json.dumps({"url": MCP_URL, "schema": 2, "tip": tip, "maps": persisted}))
+                temporary.chmod(0o600)
+                temporary.replace(path)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+    except OSError:
+        pass  # the state is an accelerator; placement never fails over it
+    return merged if merged is not None else {k: v for k, v in maps.items() if k != "tip"}
 
 
 def wait_events(timeout_ms: int, **filters) -> list[dict]:
@@ -814,9 +1322,13 @@ def presence_events(**filters) -> list[tuple[dict, dict, bool]]:
     presence reads through this, so a claim anyone can write never
     supplies a host, a pane, a socket or a native session to anything
     that acts."""
+    return _presence_triples(list_events(room=ROOM_PRESENCE, **filters))
+
+
+def _presence_triples(events: list[dict]) -> list[tuple[dict, dict, bool]]:
     out = []
     keys_of: dict[str, list[bytes]] = {}
-    for event in list_events(room=ROOM_PRESENCE, **filters):
+    for event in events:
         meta = metadata_of(event)
         fields = {k: v for k, v in meta.items() if k != "sig"}
         host = fields.get("host")
@@ -876,7 +1388,14 @@ def roster(max_age_s: int = PRESENCE_TTL_S) -> dict[str, dict]:
     def vouched_age(event, fields):
         return max(_age(event), int(now - fields["at"]))
 
-    for event, fields, vouched in presence_events(since_created_at=horizon):
+    for event, fields, vouched in presence_events():
+        # The horizon is a local slice, not a server-side cursor: a
+        # since_created_at filter marks the listing caller-driven, which
+        # bypasses the disk mirror and re-pages the whole presence room on
+        # every roster fold — the single largest read cost in every
+        # one-shot command. The room itself is mirrored incrementally.
+        if str(event.get("created_at") or "") < horizon:
+            continue
         who = event.get("from_agent") or ""
         if event["type"] == "courier.scan":
             if vouched:
@@ -1462,63 +1981,29 @@ _HOSTS_CACHE: dict = {"at": 0.0, "key": None, "hosts": {}, "auth": {}, "projects
 
 
 def _refresh_hosts(max_age_s: float) -> None:
-    """Host ownership and project placement share one presence pass.
-    Cached briefly, per host and key directory: a fold opens every box,
-    and each box asks."""
+    """Host ownership and project placement read the derived presence
+    state, kept incrementally by replaying only new events. Cached
+    briefly, per host and key directory: a fold opens every box, and
+    each box asks."""
     key = (str(KEY_DIR), socket.gethostname())
     if _HOSTS_CACHE["at"] and _HOSTS_CACHE["key"] == key and time.perf_counter() - _HOSTS_CACHE["at"] < max_age_s:
         return
-    hosts: dict[str, str] = {}
-    auth: dict[str, str] = {}
-    projects: dict[str, tuple[float, dict | None, tuple | None]] = {}
-    sessions: dict[tuple, tuple[float, dict | None]] = {}
-    names: dict[str, tuple[float, dict]] = {}
-
-    def remember_project(handle: str, host: str, at: float, metadata: dict) -> None:
-        if auth.get(handle) != host:
-            return
-        scope = _project_scope(metadata.get("project_id"), metadata.get("project_name"))
-        session = metadata.get("deck_session")
-        session_key = (host, session) if session_label_file(session) else None
-        if session_key is not None and (session_key not in sessions or at >= sessions[session_key][0]):
-            sessions[session_key] = (at, scope)
-        if handle not in projects or at >= projects[handle][0]:
-            # Missing metadata in a newer announcement clears the old route.
-            projects[handle] = (at, scope, session_key)
-        if scope is not None:
-            project_id = scope["project_id"]
-            if project_id not in names or at >= names[project_id][0]:
-                names[project_id] = (at, scope)
-
-    for event, fields, vouched in presence_events():
-        host = fields.get("host")
-        if event["type"] == "courier.scan":
-            for agent in _scan_agents(fields, vouched):
-                hosts[agent["handle"]] = agent["host"]
-                if vouched:
-                    auth.setdefault(agent["handle"], host)
-                    remember_project(agent["handle"], host, fields["at"], agent)
-            continue
-        who = event.get("from_agent")
-        if who and host:
-            hosts[who] = host
-        named = fields.get("handle")
-        if vouched and isinstance(named, str) and named:
-            auth.setdefault(named, host)
-            remember_project(named, host, fields["at"], fields)
+    derived = _presence_state_refresh()
+    hosts = dict(derived["hosts"])
+    auth = {handle: host for handle, (host, _seq) in derived["auth"].items()}
     placements = {}
-    for handle, (at, scope, session_key) in projects.items():
-        latest = sessions.get(session_key)
-        if latest is not None and latest[0] > at:
+    for handle, (scope, session_key, at) in derived["projects"].items():
+        latest = derived["sessions"].get(session_key) if session_key else None
+        if latest is not None and latest[1] > at:
             # The scan's default handle and a renamed handle share a session.
-            scope = latest[1]
+            scope = latest[0]
         if scope is not None:
             placements[handle] = scope
     # Aged from the end of the pass: one that outlasts max_age_s would be
     # stale before its first reader, and every reader would repeat it.
     _HOSTS_CACHE.update(at=time.perf_counter(), key=key, hosts=hosts, auth=auth,
                         projects=placements,
-                        project_names={project_id: scope for project_id, (_, scope) in names.items()})
+                        project_names=dict(derived["names"]))
 
 
 def last_known_hosts(max_age_s: float = 2.0) -> dict[str, str]:
@@ -1561,6 +2046,7 @@ def require_pinned_hosts(handles, known: dict[str, dict] | None = None, binding=
     my_host = socket.gethostname()
     vouched = authenticated_hosts()
     claimed = last_known_hosts()
+    looked_fresh = False
     for handle in handles:
         if handle == me():
             continue
@@ -1576,6 +2062,15 @@ def require_pinned_hosts(handles, known: dict[str, dict] | None = None, binding=
             # vouched for. A bare claim only says which host's key status
             # to report, so the refusal names the pin that is missing.
             host = vouched.get(handle)
+            if not host and not looked_fresh:
+                # A peer that appeared moments ago must not be refused
+                # behind the brief placement cache: look once, fresh,
+                # before saying a host was never seen.
+                looked_fresh = True
+                _refresh_hosts(0.0)
+                vouched = authenticated_hosts(0.0)
+                claimed = last_known_hosts(0.0)
+                host = vouched.get(handle)
             if not host:
                 unvouched = (known.get(handle) or {}).get("host") or claimed.get(handle)
                 host = unvouched
@@ -2463,13 +2958,11 @@ def addressed_to_me(events: list[dict], chats: dict[str, dict] | None = None) ->
 
 def unread(since: str | None = None, chat_id: str | None = None, include_left: bool = False) -> list[dict]:
     cursor = since or read_state(inbox_cursor_name()).get("cursor")
-    filters = {"room": ROOM_CHAT}
-    if cursor:
-        filters["since_event_id"] = cursor
+    filters = {"room": ROOM_CHAT, "stream": STREAM, "limit": PAGE}
     if chat_id:
         filters["correlation_id"] = chat_id
     chats = my_chats()
-    events = [e for e in addressed_to_me(list_events(**filters), chats)
+    events = [e for e in addressed_to_me(_paged_events_relaxed(filters, cursor), chats)
               if include_left or me() not in chats[e["correlation_id"]]["left"]]
     if not events:
         return []
@@ -2533,9 +3026,7 @@ def mark_read(events: list[dict]) -> list[str]:
 
 def advance_cursor() -> None:
     cursor = read_state(inbox_cursor_name()).get("cursor")
-    filters = {"room": ROOM_CHAT}
-    if cursor:
-        filters["since_event_id"] = cursor
+    filters = {"room": ROOM_CHAT, "stream": STREAM, "limit": PAGE}
     verified, _, _ = verified_chats()
     verified_ids = {e["id"] for e in verified}
     chats = my_chats()
@@ -2546,7 +3037,7 @@ def advance_cursor() -> None:
     # that has not replicated yet leaves the event behind the cursor, so
     # it is read once they arrive; junk that never verifies is passed
     # after the hold, so the cursor is never pinned forever.
-    for e in list_events(**filters):
+    for e in _paged_events_relaxed(filters, cursor):
         if e["type"] not in CHAT_TYPES:
             continue
         if e["id"] not in verified_ids:
@@ -2773,13 +3264,8 @@ def ledger_index() -> dict:
 
 def presence_harnesses() -> dict[str, str]:
     """Every handle vouched presence has named, with the harness it last ran on."""
-    known: dict[str, str] = {}
-    for event, fields, vouched in presence_events():
-        if event["type"] == "courier.scan" or not vouched:
-            continue
-        if fields.get("handle") and fields.get("harness"):
-            known[fields["handle"]] = fields["harness"]  # oldest first; the last write is the newest
-    return known
+    derived = _presence_state_refresh()
+    return dict(derived["harness"])
 
 
 def harness_of_handle(handle: str, known: dict[str, str] | None = None) -> str:
@@ -2804,15 +3290,8 @@ def session_handles() -> dict[str, str]:
     session presence names: the newest presence event for a session names
     its agent, chosen name or default, whether or not the agent is still
     reachable."""
-    newest: dict[str, str] = {}
-    for event in list_events(room=ROOM_PRESENCE):
-        if event["type"] == "courier.scan":
-            continue
-        meta = metadata_of(event)
-        session, handle = meta.get("deck_session"), meta.get("handle")
-        if isinstance(session, str) and session and isinstance(handle, str) and handle:
-            newest[session] = handle  # events list oldest first; the last write is the newest
-    return newest
+    derived = _presence_state_refresh()
+    return dict(derived["session_handle"])
 
 
 def handle_for_session(deck_session: str, harness: str) -> str:
@@ -3715,10 +4194,8 @@ def courier_once(state: dict, host: str, verbose: bool, persist=None) -> dict:
     persist = persist or (lambda st: None)
     migrate_pending(state)
     cursor = state.get("cursor")
-    filters = {"room": ROOM_CHAT}
-    if cursor:
-        filters["since_event_id"] = cursor
-    events = list_events(**filters)
+    filters = {"room": ROOM_CHAT, "stream": STREAM, "limit": PAGE}
+    events = _paged_events_relaxed(filters, cursor)
     pending = state.setdefault("pending", {})
     held = state.setdefault("held", {})
     chats = all_chats() if pending or held or any(e["type"] in CHAT_TYPES for e in events) else {}
@@ -3765,7 +4242,7 @@ def courier_once(state: dict, host: str, verbose: bool, persist=None) -> dict:
     # message reached a reading agent; an injected one stops nothing.
     acked = set()
     cursor_before = state.get("ack_cursor")
-    fresh = list_events(room=ROOM_CHAT, type="event.ack", since_event_id=cursor_before)
+    fresh = _paged_events_relaxed({"room": ROOM_CHAT, "stream": STREAM, "limit": PAGE, "type": "event.ack"}, cursor_before)
     if fresh:
         state["ack_cursor"] = fresh[-1]["id"]
     # An acknowledgement whose key or presence has not arrived is held and
@@ -3784,7 +4261,7 @@ def courier_once(state: dict, host: str, verbose: bool, persist=None) -> dict:
     if held_acks:
         verified_events, _, bindings = verified_chats()
         index = scope_index(verified_events)
-        for a in list_events(room=ROOM_CHAT, type="event.ack", since_event_id=state.get("held_floor")):
+        for a in _paged_events_relaxed({"room": ROOM_CHAT, "stream": STREAM, "limit": PAGE, "type": "event.ack"}, state.get("held_floor")):
             if a["id"] not in held_acks:
                 continue
             # Consumed only once both hold: the signature, and a target this
@@ -4013,7 +4490,14 @@ def cmd_courier(args) -> None:
             if args.once:
                 return
             timeout = 5_000 if state.get("pending") else 60_000
-            wait_events(timeout, room=ROOM_CHAT, since_event_id=state.get("cursor"))
+            try:
+                wait_events(timeout, room=ROOM_CHAT, since_event_id=state.get("cursor"))
+            except LogstreamError as exc:
+                if not _cursor_refused(exc):
+                    raise
+                # A reset palace refuses the wait cursor too: wait from the
+                # whole room, which the next pass re-primes from its tip.
+                wait_events(timeout, room=ROOM_CHAT)
         except LogstreamError as exc:
             print(f"courier: {exc}", file=sys.stderr, flush=True)
             time.sleep(10)

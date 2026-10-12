@@ -2,7 +2,8 @@
 FROM node:26.5.0-bookworm-slim@sha256:2d49d876e96237d76de412761cf05dbfe5aee325cc4406a4d41d5824c5bb8beb
 ARG UV_VERSION=0.8.15
 ARG MEMPALACE_VERSION=3.10.0
-ARG MEMPALACE_COMMIT=22fd87f09c19d5ffb2d6966486483353937931c0
+# MemPalace PR 2631 until it lands in a release; see the Deck Dockerfile.
+ARG MEMPALACE_COMMIT=bb01fd8c00bf5890111b67fd7783fddb48c5dcbe
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-venv git ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
@@ -10,7 +11,7 @@ RUN apt-get update \
     && /tmp/uv/bin/pip install --disable-pip-version-check --no-input "uv==${UV_VERSION}" \
     && git init /tmp/source \
     && git -C /tmp/source remote add origin https://github.com/mempalace/mempalace.git \
-    && git -C /tmp/source fetch --depth 1 origin tag "v${MEMPALACE_VERSION}" \
+    && git -C /tmp/source fetch --depth 1 origin refs/pull/2631/head \
     && git -C /tmp/source checkout --detach FETCH_HEAD \
     && test "$(git -C /tmp/source rev-parse HEAD)" = "${MEMPALACE_COMMIT}" \
     && UV_PROJECT_ENVIRONMENT=/opt/mempalace/venv /tmp/uv/bin/uv sync \

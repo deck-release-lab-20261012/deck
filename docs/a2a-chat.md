@@ -67,6 +67,20 @@ the request as an unknown parameter, so the client asks once and then stops
 asking that relay. A listing that is not in append order is refused before
 anything folds or reaches the ledger's mirror.
 
+Read cost must not grow with the palace. One-shot commands list through an
+on-disk mirror per filter set: the cached events plus whatever arrived since
+the cached tip, because the stream is append-only and its events immutable.
+The presence room's mirror is retention-bounded to the roster's horizon —
+the roster folds nothing older — and placement memory, which is forever, is
+kept instead as one small derived state (hosts, first-vouch ownership,
+project placement, harness and session names) replayed only with the events
+that arrived since its tip; every update is newest-wins by the relay's
+append sequence, or earliest-wins for a first vouch, so concurrent writers
+merge under the mirror's lock without ordering. A relay that no longer
+knows a cached tip is a reset: the mirror and the state rebuild whole.
+Long-running loops — the courier, `wait`, and every caller-held cursor —
+always read the relay live.
+
 The chat's state is folded from its events, never stored:
 
 ```

@@ -81,7 +81,7 @@ assumption no measurement supports.
 | command-code | 1.79.2 | 1.21.0 | ⚠️ carried-forward documented hook; exact resume unmeasured | ⬜ unmeasured | ⬜ unmeasured |
 | cline | 3.0.70 | 3.0.53 | not applicable — fresh relaunch only | ⬜ unmeasured | ⬜ unmeasured |
 | kilo | 7.8.8 | 7.4.21 | ⚠️ carried forward | ⚠️ carried forward | ⬜ unmeasured |
-| omp | 18.9.1 | 17.2.12 | ⚠️ carried forward | ⬜ unmeasured | ⬜ unmeasured |
+| omp | 18.10.1 | 17.2.12 | ⚠️ carried forward | ⬜ unmeasured | ⬜ unmeasured |
 | qwen | 0.25.1 | 0.21.14 | not applicable — fresh relaunch only | ⬜ unmeasured | ⬜ unmeasured |
 | mimo | 0.1.15 | 0.1.13 | not applicable — fresh relaunch only | ⬜ unmeasured | ⬜ unmeasured |
 | qoder | 1.1.68 | 1.1.28 | not applicable — fresh relaunch only | ⬜ unmeasured | ⬜ unmeasured |

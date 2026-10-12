@@ -14,8 +14,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Public mirrors opt in with their exact owner/name in this Actions variable.
+  # Private repositories and forks remain ineligible, even with an opt-in.
   public-image:
-    if: github.repository == 'noisefloor-oss/deck'
+    if: >-
+      github.event.repository.visibility == 'public' &&
+      github.event.repository.fork == false &&
+      (github.repository == 'noisefloor-oss/deck' ||
+       vars.NOISEDECK_PUBLIC_RELEASE_REPOSITORY == github.repository)
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:

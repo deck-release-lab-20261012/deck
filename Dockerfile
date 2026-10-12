@@ -542,7 +542,7 @@ ARG CURSOR_AGENT_SHA256_AMD64=a79726c6e644520e993970be4c45775a6889802b67abe461a6
 ARG CURSOR_AGENT_SHA256_ARM64=785c5f6bf2a60eb1121e27ed8c14f5ee07ed1b5b6692324f2d9a997238245eb5
 ARG GROK_VERSION=1.0.50
 ARG BUN_VERSION=1.3.14
-ARG OMP_VERSION=18.9.1
+ARG OMP_VERSION=18.10.1
 ARG CRUSH_VERSION
 ARG PI_VERSION=1.1.0
 ARG DEVIN_VERSION=3000.11.3
@@ -784,12 +784,15 @@ CMD []
 # project that needs Go or Rust builds a derived image, documented in
 # docs/image-variants.md.
 FROM runtime AS mempalace
-
 ARG NOISEDECK_RUNTIME_UID=1026
 ARG NOISEDECK_RUNTIME_GID=100
 ARG UV_VERSION=0.8.15
 ARG MEMPALACE_VERSION=3.10.0
-ARG MEMPALACE_COMMIT=22fd87f09c19d5ffb2d6966486483353937931c0
+# MemPalace PR 2631 (rowid-ordered page scans with early termination and
+# compact tool replies) until it lands in a release: the logstream read
+# hot path is 3x faster at every page size. The version below is what the
+# pinned commit still reports, and the readiness checks assert it.
+ARG MEMPALACE_COMMIT=bb01fd8c00bf5890111b67fd7783fddb48c5dcbe
 USER root
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-venv python3-nacl \
@@ -798,7 +801,7 @@ RUN apt-get update \
     && /tmp/mempalace-uv/bin/pip install --disable-pip-version-check --no-input "uv==${UV_VERSION}" \
     && git init /tmp/mempalace-src \
     && git -C /tmp/mempalace-src remote add origin https://github.com/mempalace/mempalace.git \
-    && git -C /tmp/mempalace-src fetch --depth 1 origin tag "v${MEMPALACE_VERSION}" \
+    && git -C /tmp/mempalace-src fetch --depth 1 origin refs/pull/2631/head \
     && git -C /tmp/mempalace-src checkout --detach FETCH_HEAD \
     && test "$(git -C /tmp/mempalace-src rev-parse HEAD)" = "${MEMPALACE_COMMIT}" \
     && UV_PROJECT_ENVIRONMENT=/opt/mempalace/venv \

@@ -256,6 +256,11 @@ class FakeLogstream:
             raise a2a.LogstreamError("{'code': -32602, 'message': \"Unknown parameter 'order' for tool mempalace_event_list\"}", code=-32602)
         out = []
         after = args.get("since_event_id")
+        # As the real relay does: a cursor it does not know is refused, not
+        # silently treated as the beginning. A swapped or reset palace makes
+        # every client-side cache rebuild rather than merge across worlds.
+        if after is not None and after not in [e["id"] for e in self.events]:
+            raise a2a.LogstreamError(f"since_event_id {after!r} not found")
         # seq is the relay's own append order: the row's position here, as a
         # rowid would be, whatever seq a test gave the event when it wrote it.
         for position, e in enumerate(self.events, 1):
@@ -469,8 +474,11 @@ class A2ACase(unittest.TestCase):
         self.register_project()
         a2a._PUBLIC_KEYS_CACHE.update(at=0.0, keys={})
         a2a._LEGACY_IDS_CACHE.update(loaded=False)
-        a2a._HOSTS_CACHE.update(at=0.0, key=None, hosts={}, auth={})
-
+        a2a._HOSTS_CACHE.update(at=0.0, key=None, hosts={}, auth={}, projects={}, project_names={})
+        # The derived presence state is per relay instance: every test gets
+        # a fresh one, never the previous test's memo.
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
+        a2a._EVENTS_SNAPSHOT = None
     def register_project(self):
         a2a.write_state(a2a.session_label_file(self.deck_session), {
             "display_name": "", "project_id": self.project_id, "project_name": self.project_name})
@@ -605,6 +613,559 @@ class A2ACase(unittest.TestCase):
             self.run_cli(handle, "key", "announce")
         self.run_cli(pinner, "key", "trust", host, fp)
         return fp
+
+
+class PresenceStateTest(A2ACase):
+    """Placement memory is a retained-row state, derived fresh at serve:
+    the tests pin that replay in any order equals a whole fold, that the
+    first vouch survives concurrent writers and late keys, that scans and
+    forgeries judge correctly, and that one-shot commands stay bounded in
+    relay listings once the caches are warm."""
+
+    def setUp(self):
+        super().setUp()
+        self.reset_state()
+        self.addCleanup(self.reset_state)
+
+    def reset_state(self):
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
+        a2a._HOSTS_CACHE.update(at=0.0, key=None, hosts={}, auth={}, projects={}, project_names={})
+        a2a._state_path("presence-state.json").unlink(missing_ok=True)
+
+    def whole_derived(self) -> dict:
+        """A from-scratch derivation over the whole room, the reference."""
+        maps = {"rows": {}, "scans": {}}
+        a2a._fold_presence(maps, a2a._presence_triples(a2a.list_events(room=a2a.ROOM_PRESENCE)))
+        return a2a._derive_presence(maps)
+
+    def test_incremental_replay_matches_a_whole_fold(self):
+        self.presence("alice", kind="agent.online")
+        self.presence("bob", kind="agent.idle")
+        first = a2a._presence_state_refresh()
+        self.assertTrue(first["auth"])
+        self.presence("carol", kind="agent.online")
+        self.presence("alice", kind="agent.busy")
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)  # a fresh process
+        incremental = a2a._presence_state_refresh()
+        self.assertEqual(incremental, self.whole_derived())
+
+    def test_reverse_replay_keeps_the_earliest_vouch(self):
+        self.other_host("hostB")
+        self.presence("dave", "hostA", kind="agent.online")
+        self.presence("dave", "hostB", kind="agent.busy")
+        reference = self.whole_derived()
+        self.assertEqual(reference["auth"]["dave"][0], "hostA", "ordered fold: hostA vouched first")
+        maps = {"rows": {}, "scans": {}}
+        triples = a2a._presence_triples(a2a.list_events(room=a2a.ROOM_PRESENCE))
+        a2a._fold_presence(maps, list(reversed(triples)))  # arbitrary replay order
+        self.assertEqual(a2a._derive_presence(maps), reference)
+
+    def test_first_vouch_wins_across_concurrent_writers(self):
+        self.presence("alice", kind="agent.online")
+        a2a._presence_state_refresh()
+        # The stored state already places dave on hostZ from an earlier
+        # vouch; a later vouch by this host must not take the handle over.
+        path = a2a._state_path("presence-state.json")
+        doc = json.loads(path.read_text())
+        fields = {"handle": "dave", "host": "hostZ", "at": 1.0, "nonce": "n"}
+        row = {"seq": 1, "writer": "dave", "host": "hostZ", "kind": "agent.online",
+               "fields": fields, "sig": "x", "signed_shape": True, "agents": None}
+        doc["maps"]["rows"]["dave"] = {"1": row}
+        path.write_text(json.dumps(doc))
+        self.presence("dave", kind="agent.online")  # hostA vouched, later
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
+        maps = a2a._presence_state_refresh()
+        self.assertEqual(maps["auth"]["dave"][0], "hostA",
+                         "the forged hostZ row cannot vouch; hostA's real signature is the first vouch")
+
+    def test_a_late_key_promotes_presence_that_arrived_first(self):
+        state_b, host_b = self.other_host("hostB")
+        self.presence("erin", "hostB", kind="agent.online")  # no announce yet
+        derived = a2a._presence_state_refresh()
+        self.assertNotIn("erin", derived["auth"], "without the announcement nothing vouches")
+        with state_b, host_b:
+            self.run_cli("erin", "key", "announce")
+        self.run_cli("alice", "key", "trust", "hostB", a2a.host_key_status("hostB")["fingerprint"])
+        a2a._PUBLIC_KEYS_CACHE.update(at=0.0, keys={})  # the keys cache ages out
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
+        derived = a2a._presence_state_refresh()
+        self.assertEqual(derived["auth"].get("erin", ("",))[0], "hostB", "the key arriving later vouches what it sealed")
+
+    def test_a_forgery_does_not_erase_a_genuine_row(self):
+        # A signature-shaped forgery under dave's name after his genuine
+        # row: it judges false forever, and the genuine row still promotes.
+        self.presence("dave", kind="agent.online", harness="omp")
+        a2a.append("agent.online", a2a.ROOM_PRESENCE, to="*", status="ready",
+                   metadata={"handle": "dave", "host": "hostA", "harness": "claude",
+                             "at": time.time(), "nonce": "n", "sig": "forged"})
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
+        derived = a2a._presence_state_refresh()
+        self.assertEqual(derived["auth"].get("dave", ("",))[0], "hostA")
+        self.assertEqual(derived["harness"].get("dave"), "omp", "the forged row judges false; the genuine one stands")
+
+    def test_a_scan_before_its_key_authenticates_when_the_key_arrives(self):
+        state_b, host_b = self.other_host("hostB")
+        # hostB's courier scan names an agent, announced key not yet pinned.
+        import contextlib
+        with state_b, host_b:
+            a2a._rpc("mempalace_event_append", {"type": "courier.scan", "stream": a2a.STREAM,
+                        "room": a2a.ROOM_PRESENCE, "from_agent": "courier@hostB", "to_agent": "*",
+                        "status": "ready",
+                        "metadata": a2a.signed_presence("courier.scan", {
+                            "host": "hostB", "agents": [
+                                {"handle": "scan-agent", "host": "hostB", "harness": "omp",
+                                 "project_id": self.project_id, "project_name": self.project_name}]})})
+        derived = a2a._presence_state_refresh()
+        self.assertNotIn("scan-agent", derived["auth"], "without hostB's key the scan vouches nothing")
+        with state_b, host_b:
+            self.run_cli("scan-agent", "key", "announce")
+        self.run_cli("alice", "key", "trust", "hostB", a2a.host_key_status("hostB")["fingerprint"])
+        a2a._PUBLIC_KEYS_CACHE.update(at=0.0, keys={})
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
+        derived = a2a._presence_state_refresh()
+        self.assertEqual(derived["auth"].get("scan-agent", ("",))[0], "hostB",
+                         "the key arriving later vouches the scan its courier had signed")
+
+    def reference_derived(self) -> dict:
+        """An independent ordered fold over the whole room, written from the
+        pre-change semantics: hosts/auth from signed presence and scans,
+        harness from the newest vouched row that names one, session names
+        from the newest row that carries a session, and placement as the
+        newest vouched project scope per handle, ranked by signed moment."""
+        out = {"hosts": {}, "auth": {}, "harness": {}, "session_handle": {}, "projects": {}, "names": {}, "sessions": {}}
+
+        def remember(handle, host, seq, metadata, at):
+            # `at` is the signed moment that ranks placement: the enclosing
+            # row's for an ordinary presence, the enclosing scan's for an
+            # agent entry, which carries no moment of its own.
+            if out["auth"].get(handle, ("",))[0] != host:
+                return
+            rank = at if isinstance(at, (int, float)) else float(seq)
+            scope = a2a._project_scope(metadata.get("project_id"), metadata.get("project_name"))
+            session = metadata.get("deck_session")
+            skey = f"{host}\x1f{session}" if isinstance(session, str) and session and a2a.session_label_file(session) else None
+            if skey is not None:
+                cur = out["sessions"].get(skey)
+                if cur is None or rank >= cur[1]:
+                    out["sessions"][skey] = (scope, rank)
+            cur = out["projects"].get(handle)
+            if cur is None or rank >= cur[1]:
+                out["projects"][handle] = (scope, rank)
+            if scope is not None:
+                cur = out["names"].get(scope["project_id"])
+                if cur is None or rank >= cur[1]:
+                    out["names"][scope["project_id"]] = (scope, rank)
+
+        for event, fields, vouched in a2a._presence_triples(a2a.list_events(room=a2a.ROOM_PRESENCE)):
+            seq = event["seq"]
+            if event["type"] == "courier.scan":
+                if vouched:
+                    for agent in a2a._scan_agents(fields, True):
+                        handle = agent.get("handle")
+                        if isinstance(handle, str) and handle:
+                            out["hosts"][handle] = agent.get("host")
+                            out["auth"].setdefault(handle, (agent.get("host") or fields.get("host"), seq))
+                            remember(handle, agent.get("host") or fields.get("host"), seq, agent, fields.get("at"))
+                continue
+            named = fields.get("handle")
+            if isinstance(named, str) and named:
+                out["hosts"][named] = fields.get("host")
+            who = event.get("from_agent")
+            if who and who != named:
+                out["hosts"][who] = fields.get("host")
+            if not (isinstance(named, str) and named):
+                continue
+            session = fields.get("deck_session")
+            if isinstance(session, str) and session:
+                out["session_handle"][session] = named
+            if vouched:
+                out["auth"].setdefault(named, (fields.get("host"), seq))
+                if fields.get("harness"):
+                    out["harness"][named] = fields["harness"]
+                remember(named, fields.get("host"), seq, fields, fields.get("at"))
+        out["projects"] = {h: v[0] for h, v in out["projects"].items()}
+        out["names"] = {h: v[0] for h, v in out["names"].items()}
+        out["sessions"] = {h: v[0] for h, v in out["sessions"].items()}
+        return out
+
+    def reload_derived(self) -> dict:
+        """Derivation from a fresh process reading only the disk state."""
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
+        doc = a2a._presence_state_read(a2a._state_path("presence-state.json"))
+        maps = {k: v for k, v in doc["maps"].items() if k != "tip"}
+        return a2a._derive_presence(maps)
+
+    def test_every_exported_map_survives_a_reload(self):
+        # Harness flips, a cleared project, a second project, three
+        # sessions, and a claim: the winning row of each map must survive
+        # the disk round-trip exactly.
+        self.presence("h", kind="agent.online", harness="omp")
+        self.presence("h", kind="agent.busy", harness="claude")
+        self.presence("h", kind="agent.idle", harness=None)  # no harness named
+        self.presence("p1", kind="agent.online", project_id="one", project_name="One")
+        self.presence("p2", kind="agent.online", project_id="two", project_name="Two")
+        self.presence("p2", kind="agent.offline", project_id=None, project_name=None)
+        sessions = {n: f"55550000-1111-4222-8333-00000000000{n}" for n in ("a", "b", "c")}
+        for name, session in sessions.items():
+            a2a.write_state(a2a.session_label_file(session),
+                            {"display_name": "", "project_id": self.project_id, "project_name": self.project_name})
+            self.presence("s", kind="agent.online", deck_session=session, project_id="ps" + name, project_name="PS" + name.upper())
+        a2a.write_state(a2a.session_label_file("55550000-1111-4222-8333-00000000000d"),
+                        {"display_name": "", "project_id": self.project_id, "project_name": self.project_name})
+        a2a.append("agent.online", a2a.ROOM_PRESENCE, to="*", status="ready",
+                   metadata={"host": "hostA", "handle": "claim", "deck_session": "55550000-1111-4222-8333-00000000000d"})
+        reference = self.reference_derived()
+        a2a._presence_state_refresh()
+        reloaded = self.reload_derived()
+        self.assertEqual(reloaded["harness"].get("h"), "claude", "the newest named harness wins")
+        self.assertEqual((reloaded["projects"].get("p1") or ({}, None, None))[0].get("project_id"), "one")
+        self.assertIsNone((reloaded["projects"].get("p2") or (None,))[0], "a cleared project stays cleared")
+        for name, session in sessions.items():
+            self.assertEqual(reloaded["session_handle"].get(session), "s")
+        self.assertEqual(reloaded["session_handle"].get("55550000-1111-4222-8333-00000000000d"), "claim",
+                         "an unsigned row still names its session")
+        self.assertEqual(reloaded["hosts"].get("claim"), "hostA")
+        self.assertEqual(reloaded["auth"].get("h", ("",))[0], "hostA")
+        self.assertEqual({k: v for k, v in reloaded["auth"].items()}, {k: v for k, v in reference["auth"].items()})
+        self.assertEqual(reloaded["names"].get("one"), reference["names"]["one"])
+        self.assertEqual(reloaded["names"].get("two"), reference["names"]["two"])
+        self.assertEqual(reloaded["session_handle"], reference["session_handle"])
+        self.assertEqual({k: v[0] for k, v in reloaded["sessions"].items()}, reference["sessions"])
+
+    def test_out_of_order_scan_moments_rank_by_the_scans_signature(self):
+        # Two vouched scans for the same handle, project and session,
+        # signed at 30 then at 10: placement is the moment-30 scan,
+        # whatever their relay order says.
+        session = "66660000-1111-4222-8333-00000000000a"
+        a2a.write_state(a2a.session_label_file(session),
+                        {"display_name": "", "project_id": self.project_id, "project_name": self.project_name})
+        clock = iter([30, 10] + [50] * 50)
+        for project in ("new", "old"):
+            with mock.patch.object(a2a.time, "time", side_effect=lambda: next(clock)):
+                a2a._rpc("mempalace_event_append", {"type": "courier.scan", "stream": a2a.STREAM,
+                            "room": a2a.ROOM_PRESENCE, "from_agent": "courier@hostA", "to_agent": "*",
+                            "status": "ready",
+                            "metadata": a2a.signed_presence("courier.scan", {"host": "hostA", "agents": [
+                                {"handle": "dave", "host": "hostA", "harness": "omp", "deck_session": session,
+                                 "project_id": project, "project_name": project.upper()}]})})
+        a2a._presence_state_refresh()
+        reloaded = self.reload_derived()
+        reference = self.reference_derived()
+        self.assertEqual(reference["projects"].get("dave", {}).get("project_id"), "new")
+        self.assertEqual((reloaded["projects"].get("dave") or ({}, None, None))[0].get("project_id"), "new")
+        self.assertEqual(reference["names"], reloaded["names"])
+        self.assertEqual(reference["sessions"], {k: v[0] for k, v in reloaded["sessions"].items()})
+
+    def test_the_cursor_advances_across_separate_refreshes(self):
+        self.presence("alice", kind="agent.online")
+        a2a._presence_state_refresh()
+        for i in range(12):
+            self.presence("chatty", kind="agent.busy", native_session=f"t{i}")
+            a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
+            with mock.patch.object(a2a, "_paged_events", wraps=a2a._paged_events) as paged:
+                a2a._presence_state_refresh()
+                del paged  # the stored cursor is asserted from the state file below
+            doc = a2a._presence_state_read(a2a._state_path("presence-state.json"))
+            last = a2a.list_events(room=a2a.ROOM_PRESENCE)[-1]["id"]
+            self.assertEqual(doc["tip"]["id"], last, f"refresh {i}: the stored cursor is the tip")
+
+    def test_sessions_placement_survives_pruning(self):
+        # Session A at moments 10, 30, 20 then session B at 40: A's placement
+        # is the moment-30 row; it must survive the prune.
+        session_a = "33330000-1111-4222-8333-00000000000a"
+        session_b = "33330000-1111-4222-8333-00000000000b"
+        for session in (session_a, session_b):
+            a2a.write_state(a2a.session_label_file(session), {"display_name": "", "project_id": self.project_id, "project_name": self.project_name})
+        clock = iter([10, 30, 20, 40] + [50] * 200)
+        with mock.patch.object(a2a.time, "time", side_effect=lambda: next(clock)):
+            self.presence("s", kind="agent.online", deck_session=session_a, project_id="pa", project_name="PA")
+            self.presence("s", kind="agent.busy", deck_session=session_a, project_id="pb", project_name="PB")
+            self.presence("s", kind="agent.idle", deck_session=session_a, project_id="pa", project_name="PA")
+            self.presence("s", kind="agent.online", deck_session=session_b, project_id="pc", project_name="PC")
+        a2a._presence_state_refresh()
+        reloaded = self.reload_derived()
+        # The handle's placement is its newest vouched moment, whichever
+        # session carried it; the sessions map is per session value.
+        self.assertEqual((reloaded["projects"].get("s") or ({},))[0].get("project_id"), "pc")
+        sessions = {k.split("\x1f")[-1]: v for k, v in reloaded["sessions"].items()}
+        self.assertEqual((sessions.get(session_a) or (None,))[0].get("project_id"), "pb",
+                         "session A's placement is its moment-30 row, not the older moment-20 one")
+        self.assertEqual((sessions.get(session_b) or (None,))[0].get("project_id"), "pc")
+
+    def test_an_aged_out_mirror_still_reads_incrementally(self):
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 30 * a2a.PRESENCE_TTL_S))
+        events = [{"id": f"e{i:05d}", "created_at": old} for i in range(1100)]
+        a2a.snapshot_events()
+        calls, call = self.relay_calls(events)
+        with mock.patch.object(a2a, "_rpc", side_effect=call):
+            a2a._read_events({"room": a2a.ROOM_PRESENCE})
+            for _ in range(3):
+                calls.clear()
+                kept = a2a._read_events({"room": a2a.ROOM_PRESENCE})
+                self.assertEqual(kept, [], "nothing survives the retention")
+                self.assertEqual(len(calls), 1, "a quiet palace reads one delta page from the kept tip")
+                self.assertEqual(calls[0].get("since_event_id"), "e01099")
+
+    def test_a_republished_scan_keeps_bounded_rows(self):
+        agents = [{"handle": "dave", "host": "hostA", "harness": "omp",
+                   "project_id": self.project_id, "project_name": self.project_name}]
+        for _ in range(12):
+            a2a._rpc("mempalace_event_append", {"type": "courier.scan", "stream": a2a.STREAM,
+                        "room": a2a.ROOM_PRESENCE, "from_agent": "courier@hostA", "to_agent": "*",
+                        "status": "ready",
+                        "metadata": a2a.signed_presence("courier.scan", {"host": "hostA", "agents": agents})})
+        a2a._presence_state_refresh()
+        doc = a2a._presence_state_read(a2a._state_path("presence-state.json"))
+        self.assertLessEqual(len(doc["maps"]["scans"]["hostA"]), 3,
+                             f"an unchanged roster keeps its extrema, not every scan (kept {len(doc['maps']['scans']['hostA'])})")
+
+    def test_a_scan_does_not_displace_a_session_name(self):
+        # A chosen handle names sessions B, A, C; a later vouched scan
+        # carries a default handle for A. Session names come from ordinary
+        # rows only, so A must still resolve to the chosen handle.
+        for suffix in ("b", "a", "c"):
+            a2a.write_state(a2a.session_label_file("33330000-1111-4222-8333-000000000000"[:-1] + suffix),
+                            {"display_name": "", "project_id": self.project_id, "project_name": self.project_name})
+        self.presence("chosen", kind="agent.online", deck_session="33330000-1111-4222-8333-00000000000b")
+        self.presence("chosen", kind="agent.busy", deck_session="33330000-1111-4222-8333-00000000000a")
+        self.presence("chosen", kind="agent.idle", deck_session="33330000-1111-4222-8333-00000000000c")
+        default = {"handle": "omp-3333", "host": "hostA", "harness": "omp",
+                   "deck_session": "33330000-1111-4222-8333-00000000000a",
+                   "project_id": self.project_id, "project_name": self.project_name}
+        a2a._rpc("mempalace_event_append", {"type": "courier.scan", "stream": a2a.STREAM,
+                    "room": a2a.ROOM_PRESENCE, "from_agent": "courier@hostA", "to_agent": "*",
+                    "status": "ready",
+                    "metadata": a2a.signed_presence("courier.scan", {"host": "hostA", "agents": [default]})})
+        derived = a2a._presence_state_refresh()
+        reloaded = self.reload_derived()
+        self.assertEqual(reloaded["session_handle"].get("33330000-1111-4222-8333-00000000000a"), "chosen")
+        self.assertEqual(derived["session_handle"].get("33330000-1111-4222-8333-00000000000a"), "chosen")
+
+    def test_non_owner_placement_cannot_resurrect_a_cleared_project(self):
+        state_b, host_b = self.other_host("hostB")
+        self.pin_remote_host("h", "hostB")
+        self.presence("h", kind="agent.online", project_id="pa", project_name="PA")
+        self.presence("h", kind="agent.idle", project_id=None, project_name=None)  # owner clears
+        with state_b, host_b:
+            with self.as_agent("h"):
+                a2a.append("agent.online", a2a.ROOM_PRESENCE, to="*", status="ready",
+                           metadata=a2a.signed_presence("agent.online", {
+                               "host": "hostB", "handle": "h", "harness": "omp",
+                               "project_id": "pz", "project_name": "PZ"}))
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
+        derived = a2a._presence_state_refresh()
+        reloaded = self.reload_derived()
+        self.assertIsNone((reloaded["projects"].get("h") or (None,))[0],
+                          "the owner cleared it; a non-owner row restores nothing")
+
+    def test_a_rotation_can_revive_a_row_that_failed(self):
+        state_b, host_b = self.other_host("hostB")
+        with state_b, host_b:
+            self.run_cli("erin", "key", "announce")
+        old_fp = a2a.host_key_status("hostB")["fingerprint"]
+        self.run_cli("alice", "key", "trust", "hostB", old_fp)
+        a2a._PUBLIC_KEYS_CACHE.update(at=0.0, keys={})
+        # hostB rotates: a fresh key announces, not yet pinned here.
+        state_b2, host_b2 = self.other_host("hostB", fresh=True)
+        with state_b2, host_b2:
+            self.run_cli("erin", "key", "announce")
+            # A presence row signed by the new key: written directly, because
+            # the helper signs with the cached original key directory.
+            with self.as_agent("erin"):
+                a2a.append("agent.busy", a2a.ROOM_PRESENCE, to="*", status="ready",
+                           metadata=a2a.signed_presence("agent.busy", {
+                               "host": "hostB", "handle": "erin", "harness": "omp",
+                               "project_id": self.project_id, "project_name": self.project_name}))
+        new_fp = a2a.host_key_status("hostB")["fingerprint"]
+        self.assertNotEqual(old_fp, new_fp)
+        a2a._PUBLIC_KEYS_CACHE.update(at=0.0, keys={})
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
+        derived = a2a._presence_state_refresh()
+        self.assertNotIn("erin", derived["auth"], "the new key is unpinned: nothing vouches")
+        # A row on another host vouches meanwhile and takes ownership...
+        self.presence("erin", kind="agent.online")  # hostA, later
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
+        derived = a2a._presence_state_refresh()
+        self.assertEqual(derived["auth"].get("erin", ("",))[0], "hostA")
+        # ...and pinning the new key revives the earlier hostB row.
+        self.run_cli("alice", "key", "trust", "hostB", new_fp)
+        a2a._PUBLIC_KEYS_CACHE.update(at=0.0, keys={})
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
+        derived = a2a._presence_state_refresh()
+        self.assertEqual(derived["auth"].get("erin", ("",))[0], "hostB", "either pinned key vouches its rows")
+
+    def test_repeated_updates_keep_the_disk_state_bounded(self):
+        for i in range(12):
+            self.presence("chatty", kind="agent.busy", native_session=f"t{i}")
+        a2a._presence_state_refresh()
+        doc = a2a._presence_state_read(a2a._state_path("presence-state.json"))
+        rows = doc["maps"]["rows"]["chatty"]
+        self.assertLessEqual(len(rows), 6,
+                             f"an unchanged handle folds to its extrema, not its history (kept {len(rows)})")
+
+    def test_scan_session_placement_survives_pruning(self):
+        session_a = "44440000-1111-4222-8333-00000000000a"
+        session_b = "44440000-1111-4222-8333-00000000000b"
+        for session in (session_a, session_b):
+            a2a.write_state(a2a.session_label_file(session), {"display_name": "", "project_id": self.project_id, "project_name": self.project_name})
+        moments = [10, 30, 20, 40]
+        projects = ["pa", "pb", "pa", "pc"]
+        sessions = [session_a, session_a, session_a, session_b]
+        clock = iter(moments + [50] * 200)
+        for project, session in zip(projects, sessions):
+            with mock.patch.object(a2a.time, "time", side_effect=lambda: next(clock)):
+                a2a._rpc("mempalace_event_append", {"type": "courier.scan", "stream": a2a.STREAM,
+                            "room": a2a.ROOM_PRESENCE, "from_agent": "courier@hostA", "to_agent": "*",
+                            "status": "ready",
+                            "metadata": a2a.signed_presence("courier.scan", {"host": "hostA", "agents": [
+                                {"handle": "s", "host": "hostA", "harness": "omp", "deck_session": session,
+                                 "project_id": project, "project_name": project.upper()}]})})
+        a2a._presence_state_refresh()
+        reloaded = self.reload_derived()
+        got = {k.split("\x1f")[-1]: v for k, v in reloaded["sessions"].items()}
+        self.assertEqual((got.get(session_a) or (None,))[0].get("project_id"), "pb",
+                         "session A's scan placement is its moment-30 scan")
+        self.assertEqual((got.get(session_b) or (None,))[0].get("project_id"), "pc")
+        self.assertEqual(reloaded["names"].get("pb"), {"project_id": "pb", "project_name": "PB"},
+                         "the project name the middle scan carried survives")
+
+    def test_late_peer_replication_advances_the_tip_by_sequence(self):
+        # A warm mirror at a locally-newer event, then a peer's older-
+        # timestamped events append after it: the tip follows the relay's
+        # append sequence, not the id's clock, so the next read resumes
+        # from the final row.
+        fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        old_day = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 86400))
+        local = [{"id": "evt_20261012T140000_local", "seq": 1, "created_at": fresh}]
+        peer = [{"id": f"evt_20261011T{i:02d}0000_peer", "seq": 2 + i, "created_at": old_day} for i in range(1100)]
+        a2a.snapshot_events()
+        calls, call = self.relay_calls(local)
+        with mock.patch.object(a2a, "_rpc", side_effect=call):
+            a2a._read_events({"room": a2a.ROOM_CHAT})
+        calls, call = self.relay_calls(local + peer)
+        with mock.patch.object(a2a, "_rpc", side_effect=call):
+            a2a._read_events({"room": a2a.ROOM_CHAT})
+        cache = next(Path(a2a.STATE_DIR).glob("events-cache-*.json"))
+        doc = json.loads(cache.read_text())
+        self.assertEqual(doc["tip"]["id"], peer[-1]["id"], "the tip is the relay's last row, whatever its clock says")
+        calls, call = self.relay_calls(local + peer)
+        with mock.patch.object(a2a, "_rpc", side_effect=call):
+            a2a._read_events({"room": a2a.ROOM_CHAT})
+        self.assertEqual(len(calls), 1, "a quiet room reads one delta page from the sequence-merged tip")
+        self.assertEqual(calls[0].get("since_event_id"), peer[-1]["id"])
+
+    def test_presence_mirror_is_retention_bounded(self):
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 10 * a2a.PRESENCE_TTL_S))
+        fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        events = [{"id": "e1", "created_at": old}, {"id": "e2", "created_at": fresh}]
+        a2a.snapshot_events()
+        with mock.patch.object(a2a, "_rpc", side_effect=self.relay_calls(events)[1]):
+            a2a._read_events({"room": a2a.ROOM_PRESENCE})  # the cold fill fetches all
+            kept = a2a._read_events({"room": a2a.ROOM_PRESENCE})
+        self.assertEqual([e["id"] for e in kept], ["e2"])
+        cache = next(Path(a2a.STATE_DIR).glob("events-cache-*.json"))
+        self.assertEqual([e["id"] for e in json.loads(cache.read_text())["events"]], ["e2"],
+                         "the mirror drops what the retention outlived")
+
+    def relay_calls(self, events):
+        calls = []
+
+        def call(tool, args, timeout=30.0):
+            calls.append(dict(args))
+            out = [dict(e, seq=n) for n, e in enumerate(events, 1)]
+            since = args.get("since_event_id")
+            if since is not None:
+                if since not in [e["id"] for e in events]:
+                    raise a2a.LogstreamError(f"mempalace_event_list: since_event_id {since!r} not found")
+                out = out[[e["id"] for e in events].index(since) + 1:]
+            return {"events": out[: args.get("limit", 500)]}
+
+        return calls, call
+
+    def test_warm_one_shot_commands_stay_bounded_in_listings(self):
+        self.online("alice", "bob", "carol")
+        self.run_cli("alice", "chat", "bob", "hello")
+        with self.as_agent("bob"):
+            a2a.snapshot_events()
+            try:
+                a2a.main(["inbox", "--peek"])
+            finally:
+                a2a.release_events()
+        self.reset_state()
+        self.ls.listings.clear()
+        with self.as_agent("bob"):
+            a2a.snapshot_events()
+            try:
+                a2a.main(["inbox", "--peek"])
+            finally:
+                a2a.release_events()
+        # A warm peek lists a delta per room, not the rooms: the unbounded
+        # fan-out this replaces made one peek page whole rooms per cursor.
+        self.assertLessEqual(len(self.ls.listings), 6, f"warm peek listings: {self.ls.listings}")
+
+    def test_relay_reset_rebuilds_the_state_and_downtime_propagates(self):
+        self.presence("alice", kind="agent.online")
+        a2a._presence_state_refresh()
+        path = a2a._state_path("presence-state.json")
+        doc = json.loads(path.read_text())
+        doc["tip"] = {"id": "evt_deadbeef", "seq": 424242}
+        path.write_text(json.dumps(doc))
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
+
+        original = a2a._paged_events
+
+        def refusing(filters, since=None):
+            if since is not None:
+                raise a2a.LogstreamError("mempalace_event_list: since_event_id 'evt_deadbeef' not found")
+            return original(filters)
+
+        with mock.patch.object(a2a, "_paged_events", side_effect=refusing):
+            maps = a2a._presence_state_refresh()
+        self.assertIn("alice", maps["auth"], "a refused tip rebuilds the whole state")
+
+        def down(filters, since=None):
+            raise a2a.LogstreamError("connection refused")
+
+        doc["tip"] = {"id": a2a.list_events(room=a2a.ROOM_PRESENCE)[-1]["id"], "seq": 1}
+        path.write_text(json.dumps(doc))
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
+        with mock.patch.object(a2a, "_paged_events", side_effect=down):
+            with self.assertRaises(a2a.LogstreamError):
+                a2a._presence_state_refresh()
+
+    def test_relaxed_cursors_fall_back_only_on_a_refusal(self):
+        events = [{"id": "e1"}, {"id": "e2"}]
+        calls, call = self.relay_calls(events)
+        filters = {"room": a2a.ROOM_CHAT, "stream": a2a.STREAM, "limit": a2a.PAGE}
+        with mock.patch.object(a2a, "_rpc", side_effect=call):
+            self.assertEqual([e["id"] for e in a2a._paged_events_relaxed(filters, "e1")], ["e2"])
+        self.assertEqual(calls[-1].get("since_event_id"), "e1")
+
+        def method_missing(tool, args, timeout=30.0):
+            if args.get("since_event_id"):
+                raise a2a.LogstreamError("Method not found", code=-32601)
+            return {"events": events}
+
+        with mock.patch.object(a2a, "_rpc", side_effect=method_missing):
+            with self.assertRaises(a2a.LogstreamError):
+                a2a._paged_events_relaxed(filters, "e1")
+
+    def test_a_stale_writer_never_deletes_a_faster_writers_rows(self):
+        self.presence("alice", kind="agent.online")
+        a2a._presence_state_refresh()
+        path = a2a._state_path("presence-state.json")
+        # A faster writer folds and stores bob's newer row...
+        self.presence("bob", kind="agent.online")
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
+        a2a._presence_state_refresh()
+        # ...while we hold a stale map that never saw it, and merge last.
+        stale = {"rows": {}, "scans": {}}
+        a2a._fold_presence(stale, a2a._presence_triples(
+            [e for e in a2a.list_events(room=a2a.ROOM_PRESENCE) if a2a.metadata_of(e).get("handle") != "bob"]))
+        a2a._presence_state_store(path, stale, {"id": "evt_earlier", "seq": 1})
+        doc = json.loads(path.read_text())
+        self.assertIn("bob", doc["maps"]["rows"], "the stale writer's merge keeps the faster writer's row")
+        self.assertLessEqual(doc["tip"]["seq"], 3, "and it never rewinds the tip")
 
 
 class SessionLabelTest(A2ACase):
@@ -2643,13 +3204,16 @@ class A2ATest(A2ACase):
             a2a.last_known_hosts(max_age_s=0)
         asked = [args for args in self.ls.listings if "order" in args]
         self.assertEqual(len(asked), 1)
-        self.assertGreaterEqual(len(self.ls.listings), 5, "two full reads, two pages each, after the one refusal")
+        self.assertGreaterEqual(len(self.ls.listings), 3, "a full two-page read, then the state's delta")
         self.assertTrue(a2a._ORDER_REFUSED)
 
     def test_a_relay_upgraded_under_a_running_process_is_asked_again(self):
-        """A courier that saw a 3.8.0 relay refuse `order` reads without it;
+        """A client that saw a 3.8.0 relay refuse `order` reads without it;
         when that relay comes back as 3.10.0 and lists newest first, the
-        courier asks again and reads in order, with no restart."""
+        next whole-room read — the derived state rebuilding, as a reset
+        palace or a fresh process makes it — asks again and reads in
+        order, with no restart. Cursor deltas are ordered by construction
+        and never re-ask on their own."""
         self.ls = FakeLogstream(refuses_order=True)
         self.online("alice")
         with self.as_agent("observer"):
@@ -2657,19 +3221,25 @@ class A2ATest(A2ACase):
         self.assertTrue(a2a._ORDER_REFUSED)
         self.ls.refuses_order = False
         self.online("bob")
-        del self.ls.listings[:]
         with self.as_agent("observer"):
             self.assertEqual(a2a.last_known_hosts(max_age_s=0), {"alice": "hostA", "bob": "hostA"})
-        self.assertFalse(a2a._ORDER_REFUSED)
-        self.assertEqual([("order" in args) for args in self.ls.listings], [False, True], "one unordered page, then asked again")
+        self.assertTrue(a2a._ORDER_REFUSED, "a cursor delta never re-asks on its own")
+        del self.ls.listings[:]
+        a2a._state_path("presence-state.json").unlink()
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
+        with self.as_agent("observer"):
+            self.assertEqual(a2a.last_known_hosts(max_age_s=0), {"alice": "hostA", "bob": "hostA"})
+        self.assertFalse(a2a._ORDER_REFUSED, "the rebuild sees the misorder and asks again")
         # A relay that refuses the parameter and lists newest first anyway is
         # asked once more and then refused, not retried forever.
         self.ls = FakeLogstream(refuses_order=True, ignores_order=True)
         self.online("carol", "dave")
         del self.ls.listings[:]
+        a2a._state_path("presence-state.json").unlink()
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
         with self.as_agent("observer"), self.assertRaisesRegex(a2a.LogstreamError, "append order"):
             a2a.last_known_hosts(max_age_s=0)
-        self.assertEqual(len(self.ls.listings), 4)
+        self.assertGreaterEqual(len(self.ls.listings), 2)
 
     def test_only_the_relays_unknown_parameter_answer_downgrades_the_asking(self):
         """Any other failure while asking for the order propagates and
@@ -4443,11 +5013,15 @@ class SealedAuthorityTest(A2ACase):
 
     def hide(self, keep):
         """Take events off the relay for a while, as if they had not
-        replicated yet; returns them for restore."""
+        replicated yet; returns them for restore. The derived presence
+        state is dropped with them: it must hold nothing the relay does
+        not, exactly as a process that folded only what had arrived."""
         hidden = [e for e in self.ls.events if not keep(e)]
         self.ls.events[:] = [e for e in self.ls.events if keep(e)]
         a2a._PUBLIC_KEYS_CACHE.update(at=0.0, keys={})
         a2a._HOSTS_CACHE.update(at=0.0)
+        a2a._state_path("presence-state.json").unlink(missing_ok=True)
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
         return hidden
 
     def restore(self, hidden):
@@ -4455,6 +5029,8 @@ class SealedAuthorityTest(A2ACase):
         self.ls.events.sort(key=lambda e: e["seq"])
         a2a._PUBLIC_KEYS_CACHE.update(at=0.0, keys={})
         a2a._HOSTS_CACHE.update(at=0.0)
+        a2a._state_path("presence-state.json").unlink(missing_ok=True)
+        a2a._PRESENCE_STATE_MEMO.update(derived=None, at=0.0)
 
     def test_an_event_whose_key_or_presence_arrives_later_is_still_delivered_and_read(self):
         """Replication has no order across rooms: an invite can land before
@@ -4465,6 +5041,7 @@ class SealedAuthorityTest(A2ACase):
         with self.state_b, self.host_b:
             self.run_cli("far", "chat", "alice", "early bird")
         invite = [e for e in self.ls.events if e["type"] == "chat.invite"][-1]
+
         for what, keep in (
             ("key", lambda e: not (e["type"] == "key.announce" and a2a.metadata_of(e).get("host") == "hostB")),
             ("presence", lambda e: not (e["room"] == a2a.ROOM_PRESENCE and a2a.metadata_of(e).get("handle") == "far")),
@@ -4509,6 +5086,7 @@ class SealedAuthorityTest(A2ACase):
         with mock.patch.object(a2a, "_age", return_value=a2a.HOLD_S + 1), self.as_agent("alice"):
             a2a.advance_cursor()
             self.assertGreater(a2a.read_state(a2a.inbox_cursor_name()).get("cursor"), junk["id"], "past the junk once the hold ran out")
+
 
     def test_a_released_x25519_key_is_migrated_to_a_sealing_key_and_re_pinned(self):
         """Fixture from the keys release: a bare X25519 host-key, an announce

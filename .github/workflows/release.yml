@@ -9,8 +9,14 @@ permissions:
   contents: read
 
 jobs:
+  # Public mirrors opt in with their exact owner/name in this Actions variable.
+  # Private repositories and forks remain ineligible, even with an opt-in.
   release-create:
-    if: github.repository == 'noisefloor-oss/deck'
+    if: >-
+      github.event.repository.visibility == 'public' &&
+      github.event.repository.fork == false &&
+      (github.repository == 'noisefloor-oss/deck' ||
+       vars.NOISEDECK_PUBLIC_RELEASE_REPOSITORY == github.repository)
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -27,7 +33,11 @@ jobs:
             --notes "noise-deck $GITHUB_REF_NAME — binaries and SHA256SUMS attached by the release workflow."
 
   build:
-    if: github.repository == 'noisefloor-oss/deck'
+    if: >-
+      github.event.repository.visibility == 'public' &&
+      github.event.repository.fork == false &&
+      (github.repository == 'noisefloor-oss/deck' ||
+       vars.NOISEDECK_PUBLIC_RELEASE_REPOSITORY == github.repository)
     needs: release-create
     runs-on: ${{ matrix.os }}
     strategy:
@@ -100,7 +110,11 @@ jobs:
           if-no-files-found: error
 
   asset-publish:
-    if: github.repository == 'noisefloor-oss/deck'
+    if: >-
+      github.event.repository.visibility == 'public' &&
+      github.event.repository.fork == false &&
+      (github.repository == 'noisefloor-oss/deck' ||
+       vars.NOISEDECK_PUBLIC_RELEASE_REPOSITORY == github.repository)
     needs: build
     runs-on: ubuntu-24.04
     permissions:
