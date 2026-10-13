@@ -5,6 +5,9 @@
 # Distinct loopback addresses keep app cookies separate from Deck and each
 # other; see docs/project-app-preview-loopback.md.
 # Linux only by default; macOS needs lo0 aliases for every slot address.
+# Colima also needs the selected-profile forwarding prerequisite and real Mac
+# ingress checks in docs/project-app-preview-operations.md; aliases alone
+# are insufficient. Keep these exact host-loopback publications.
 services:
   app:
     environment:

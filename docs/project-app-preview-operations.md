@@ -12,7 +12,8 @@ server processes. The `unconfined: true` setting acknowledges this boundary.
 ## Loopback install
 
 For Deck opened at `http://127.0.0.1:<port>` or `http://localhost:<port>`,
-enable previews without DNS, TLS or a reverse proxy. With Docker:
+enable previews without DNS, TLS or a reverse proxy. Satisfy the host
+prerequisites below before starting the Docker overlay. With Docker:
 
 ```sh
 docker compose -f compose.yaml -f compose.previews.yaml up -d
@@ -21,8 +22,10 @@ docker compose -f compose.yaml -f compose.previews.yaml up -d
 The overlay publishes eight gateway slots on `127.0.0.2` through `127.0.0.9`,
 all on port 8840. It does not publish dev-server ports. Linux routes these
 addresses to loopback by default; macOS needs an alias on `lo0` for each
-slot address. If overriding the port pool, keep its size equal to the number
-of published slots.
+slot address. With Colima, also satisfy the
+[forwarding prerequisite](#macos-with-colima-forwarding-prerequisite); aliases
+alone do not prove Docker VM forwarding. If overriding the port pool, keep
+its size equal to the number of published slots.
 
 For a native installation, set these four keys and restart Deck:
 
@@ -56,8 +59,77 @@ point to that browser's own machine. See the
 [loopback design](project-app-preview-loopback.md) for the browser cookie and
 origin rules.
 
-The rest of this document describes the hosted (domain) setup. The project-owned
-dev command and Vite example also work with loopback previews.
+The sections following the Colima loopback prerequisite describe the hosted
+(domain) setup. The project-owned dev command and Vite example also work
+with loopback previews.
+
+## macOS with Colima: forwarding prerequisite
+
+Mac `lo0` aliases are necessary but may not be sufficient for Docker VM
+forwarding. With Colima 0.10.3 / Lima 2.2.0, the default
+`network.hostAddresses: false` left the preview aliases unreachable from the
+Mac even though Docker published all eight exact addresses and the gateway
+answered inside the VM. This is a host/VM prerequisite failure, not proof of
+an authentication failure. Other providers, including Docker Desktop, need
+their own real-host checks; this procedure does not qualify them.
+
+For a dedicated, explicitly selected Colima profile, the supported repair is
+`network.hostAddresses: true` with `network.address: false`. Have the operator
+configure the required `lo0` aliases **before** starting that profile with
+host-address forwarding enabled. Alias creation is a separate privileged
+host-network operation; enabling this Colima setting does not require Mac
+`sudo`. Check each alias/port for collisions before proceeding.
+
+The operator must approve and coordinate a VM restart: it interrupts **all**
+containers and processes in the selected profile, not just Deck. Recheck
+active work before stopping it, and recheck container health and application
+readiness afterward. Do not touch other profiles. For an existing profile whose
+`network.address` is false, `portForwarder` is `ssh`, and `autoActivate`
+is false, preserve those settings and all other configuration:
+
+```sh
+colima stop --profile PROFILE
+colima start --profile PROFILE --network-host-addresses
+```
+
+Replace the literal `PROFILE` placeholder with the operator-selected
+dedicated profile. Do not use bare default-profile commands, `sudo colima`,
+`--activate`, or change the global Docker context. Use that profile's
+explicit Docker context for subsequent Compose operations. A running
+`colima start` is not a substitute for stop/start. Do not hand-edit generated
+Lima configuration, add an ad-hoc forwarder, or replace exact host-loopback
+publishing with wildcard/public bindings.
+
+Host-address forwarding enumerates **all host IPv4 addresses**, not only the
+preview aliases. It broadens this VM's forwarding eligibility; it is not a
+firewall. Verify that applications in the selected profile remain explicitly
+loopback-published and that no wildcard/nonloopback application listeners
+appear. The container-side gateway bind `0.0.0.0:8840` in the overlay is
+not permission to publish that port on the host's `0.0.0.0`.
+
+After restart, verify the selected settings and all eight generated exact TCP
+rules: guest IP and host IP must both be each corresponding address from
+`127.0.0.2` through `127.0.0.9`. Then check actual published-port ownership
+and bindings and probe each address **from the Mac**, not merely from inside
+the VM. For example, without cookies, tokens, proxies or redirect following:
+
+```sh
+curl --noproxy '*' --connect-timeout 3 --max-time 5 --silent --show-error \
+  --output /dev/null --write-out '%{http_code}\n' http://127.0.0.2:8840/
+```
+
+Repeat for every published slot using the configured gateway port. An active
+registered slot refuses an anonymous request with HTTP 403; an unused slot
+returns HTTP 421. Do not require 403 from every slot. A timeout, connection
+failure, HTTP 000 or HTTP 503 is not a passing refusal. Also confirm Deck's
+ordinary loopback listener still answers. A successful startup or Docker
+port listing alone does not prove Mac ingress.
+
+These checks establish forwarding only. Separately verify authenticated
+previews, assets/routes/APIs, WebSockets/HMR, cookie and cross-project
+boundaries, and logout/disable/restart behavior through the actual Mac browser
+before claiming installed-host preview acceptance. If forwarding fails, stop
+and report it without widening binds or bypassing authentication.
 
 ## One-time host setup
 

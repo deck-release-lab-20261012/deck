@@ -191,6 +191,11 @@ Proceed only when discovery found no Deck installation or partial Deck volumes.
    Previews publish 127.0.0.2–9:8840; macOS needs all those loopback aliases
    first. If absent, ask the user to configure them separately or omit
    previews; this skill does not authorize privileged network changes.
+   With Colima, aliases alone are insufficient: see the
+   [selected-profile forwarding prerequisite](../../docs/project-app-preview-operations.md#macos-with-colima-forwarding-prerequisite).
+   Stop for the operator if that prerequisite or actual Mac ingress fails;
+   this skill does not authorize a Colima VM restart or provider reconfiguration.
+   Other Docker VM providers require their own real-host forwarding checks.
 4. **Build and start:** `PREFIX up --build -d`. This builds the release's
    pinned public sources/dependencies; no GitHub token is needed for the
    public source build and no prebuilt Deck image is pulled. Wait for

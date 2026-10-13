@@ -94,7 +94,10 @@ Docker: `compose.previews.yaml` sets these variables, sets `bind` to
 the host to the container's port 8840 (eight slots, matching the default
 pool of eight). The host must route the whole `127.0.0.0/8` block to its
 loopback interface, which Linux does by default. macOS configures only
-`127.0.0.1` and needs an alias per slot address.
+`127.0.0.1` and needs an alias per slot address. Docker VM forwarding must
+also support those exact addresses: see the
+[Colima forwarding prerequisite](project-app-preview-operations.md#macos-with-colima-forwarding-prerequisite)
+and verify actual Mac ingress before using previews.
 
 ## What the dev server sees
 
