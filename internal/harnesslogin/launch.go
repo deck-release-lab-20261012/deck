@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -77,19 +78,41 @@ func launchEnvironment(ctx context.Context, provider, executable, socket string,
 	}
 }
 
-// Pi's CLI release declares a caret range for pi-ai. The version printed by
-// the CLI alone cannot qualify the OAuth implementation selected by npm.
+// Pi's exact CLI pin declares a caret range for pi-ai. Package admission must
+// follow that bounded contract; native probes qualify the packaged OAuth behavior.
 func shippedPiModules(executable string) bool {
 	real, err := filepath.EvalSymlinks(executable)
 	if err != nil || filepath.Base(real) != "cli.js" || filepath.Base(filepath.Dir(real)) != "bundle" || filepath.Base(filepath.Dir(filepath.Dir(real))) != "dist" {
 		return false
 	}
 	root := filepath.Dir(filepath.Dir(filepath.Dir(real)))
-	return packageVersion(filepath.Join(root, "package.json"), "@earendil-works/pi-coding-agent", piVersion) &&
-		packageVersion(filepath.Join(root, "node_modules", "@earendil-works", "pi-ai", "package.json"), "@earendil-works/pi-ai", piVersion)
+	var cli struct {
+		Name         string            `json:"name"`
+		Version      string            `json:"version"`
+		Dependencies map[string]string `json:"dependencies"`
+	}
+	if !readPackageMetadata(filepath.Join(root, "package.json"), &cli) ||
+		cli.Name != "@earendil-works/pi-coding-agent" || cli.Version != piVersion ||
+		cli.Dependencies["@earendil-works/pi-ai"] != "^"+piVersion {
+		return false
+	}
+	var ai struct {
+		Name    string `json:"name"`
+		Version string `json:"version"`
+	}
+	return readPackageMetadata(filepath.Join(root, "node_modules", "@earendil-works", "pi-ai", "package.json"), &ai) &&
+		ai.Name == "@earendil-works/pi-ai" && stableCaretVersion(ai.Version, piVersion)
 }
 
 func packageVersion(path, name, version string) bool {
+	var metadata struct {
+		Name    string `json:"name"`
+		Version string `json:"version"`
+	}
+	return readPackageMetadata(path, &metadata) && metadata.Name == name && metadata.Version == version
+}
+
+func readPackageMetadata(path string, metadata any) bool {
 	// Only fixed package-manifest suffixes derived from the configured CLI executable reach this helper.
 	file, err := os.Open(path) // #nosec G304 -- packaged code metadata, never a request-supplied path.
 	if err != nil {
@@ -100,11 +123,61 @@ func packageVersion(path, name, version string) bool {
 	if err != nil || len(data) > 64<<10 {
 		return false
 	}
-	var metadata struct {
-		Name    string `json:"name"`
-		Version string `json:"version"`
+	return json.Unmarshal(data, metadata) == nil
+}
+
+// Only canonical stable X.Y.Z versions are admitted. Prerelease and build
+// qualifiers require review rather than extending the shipped caret policy.
+func stableCaretVersion(version, minimum string) bool {
+	got, ok := stableVersion(version)
+	if !ok {
+		return false
 	}
-	return json.Unmarshal(data, &metadata) == nil && metadata.Name == name && metadata.Version == version
+	want, ok := stableVersion(minimum)
+	if !ok {
+		return false
+	}
+	for i := range got {
+		if got[i] < want[i] {
+			return false
+		}
+		if got[i] > want[i] {
+			break
+		}
+	}
+	// A caret permits changes only below the first nonzero component.
+	// Compare components directly so an upper bound cannot overflow.
+	if want[0] != 0 {
+		return got[0] == want[0]
+	}
+	if want[1] != 0 {
+		return got[0] == 0 && got[1] == want[1]
+	}
+	return got == want
+}
+
+func stableVersion(version string) ([3]uint64, bool) {
+	var result [3]uint64
+	parts := strings.Split(version, ".")
+	if len(parts) != len(result) {
+		return result, false
+	}
+	for i, part := range parts {
+		if part == "" || (len(part) > 1 && part[0] == '0') {
+			return result, false
+		}
+		for _, c := range part {
+			if c < '0' || c > '9' {
+				return result, false
+			}
+		}
+		value, err := strconv.ParseUint(part, 10, 64)
+		if err != nil {
+			return result, false
+		}
+		result[i] = value
+	}
+	return result, true
 }
 
 // ShippedCodexExecutable resolves only the shipped npm layout or a directly

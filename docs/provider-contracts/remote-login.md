@@ -7,8 +7,10 @@ there is no generic relay for an arbitrary harness or localhost URL.
 
 Exact executable admission follows the shipped Codex and Pi image pins via
 `internal/harnesslogin/versions.go`, which the daily updater moves with the
-Dockerfile. Pi's nested `pi-ai` package must match its CLI pin. New versions
-do not require separate manual qualification. Package identity, process
+Dockerfile. Pi's CLI manifest must declare `pi-ai` as exactly `^<CLI pin>`;
+the nested package must have the expected name and a canonical stable `X.Y.Z`
+version within that caret range. New versions do not require separate manual
+qualification. Package identity, process
 ownership, callback validation and ordinary compatibility tests still apply.
 The support matrix and qualification history below remain historical evidence;
 an automatic pin update does not claim a new real-account sign-in test.
@@ -100,9 +102,12 @@ The shipped image installs a native browser opener at
 `/usr/local/libexec/noisedeck-login/xdg-open`. At boot Deck checks the declared
 CLI's exact `--version` output, then supplies launch-only PATH/BROWSER additions
 for admitted harnesses. Admission is checked again before each new/recovered
-launch. Pi also requires the supported npm layout and `pi-ai` package metadata
-matching the shipped Pi version: its CLI uses a caret dependency, so the CLI version alone is not
-enough to qualify OAuth. Only packaged code manifests are read, not account
+launch. Pi also requires the supported npm layout, exact CLI package name and
+version, and its exact `^<CLI pin>` dependency declaration. The nested `pi-ai`
+package must have the expected name and a canonical stable version satisfying
+that caret range; prerelease/build qualifiers and malformed versions are not
+admitted. Real native probes qualify the packaged behavior: the CLI version
+alone is not enough. Only packaged code manifests are read, not account
 or session files. Custom BROWSER or descriptor PATH/BROWSER configuration
 keeps the native flow and disables handoff. Existing panes are not rewritten.
 The original native browser opener still runs where one was available. No

@@ -29,8 +29,14 @@ func TestNativePiBrowserRegistration(t *testing.T) {
 		t.Skip("set NOISEDECK_TEST_PI_EXECUTABLE for pinned native launch qualification")
 	}
 	version, err := exec.Command(executable, "--version").Output()
-	if err != nil || strings.TrimSpace(string(version)) != shippedVersions["pi"] || !shippedPiModules(executable) {
+	if err != nil {
+		t.Fatal("native Pi version command failed")
+	}
+	if strings.TrimSpace(string(version)) != shippedVersions["pi"] {
 		t.Fatal("native Pi version does not match shipped release")
+	}
+	if !shippedPiModules(executable) {
+		t.Fatal("native Pi package identity, layout, or dependency contract does not match shipped release")
 	}
 	for _, provider := range []string{"anthropic", "openai-codex"} {
 		t.Run(provider, func(t *testing.T) {
