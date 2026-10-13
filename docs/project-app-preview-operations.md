@@ -378,6 +378,126 @@ the dev servers. To withdraw all preview access, remove the preview ingress
 and disable preview configuration. Operator configuration changes require one
 Deck restart; managed registration changes and project source edits require none.
 
+## Docker browser helper after app maintenance
+
+For installations using `compose.browser.yaml`, Chromium joins the app's
+network namespace when its container starts. If Chromium is left running
+across an app-only container restart, it can remain in the old namespace, even
+when the app container ID is unchanged and Deck is healthy. Browser automation
+then cannot reach its normal loopback Playwright endpoint from the app.
+
+Plan app maintenance separately: coordinate idle agent sessions and take a
+[supported control-database backup](backup-restore.md). Restarting the Docker
+app container ends its co-located tmux, provider and dev-server processes;
+persistent volumes do not preserve live processes. This recovery procedure
+does not authorize another app restart, replaying tasks or relaunching servers.
+
+**Noisefloor production is excluded from the raw Compose recipe below.** Its
+canonical wrapper is `deploy/production-compose.sh`; see
+[production deployment](production-deployment.md). It has no Chromium-only
+maintenance action; `apply`, `deploy` and `deploy-cached` also recreate the app.
+Do not use those actions for this recovery or bypass the wrapper with raw helper
+recreation.
+Escalate for an approved production maintenance procedure instead.
+
+For installations whose approved maintenance supports **direct Compose**, with
+the app healthy, verify the selected installation and approved browser
+image/client version. Reuse its **complete reviewed Docker/Compose prefix**:
+the selected Docker context, project directory/name, environment file, enabled
+`--profile` selections and `COMPOSE_PROFILES`, and all enabled overlays in their
+original order, including `compose.browser.yaml`. Retain the reviewed
+overlay-selection environment, such as `COMPOSE_FILE` and installation-specific
+overlay opt-ins; do not print its values or substitute a bare default-context
+invocation. Append this subcommand to that prefix to recreate only the helper
+from the already-installed image:
+
+```sh
+up -d --no-build --pull never --force-recreate --no-deps chromium
+```
+
+Before and after this helper-only step, capture the selected app's container
+ID, `State.StartedAt` and `RestartCount`; all three must remain unchanged.
+Verify the helper uses the same approved image ID, read-only root filesystem,
+`cap_drop: ALL`, `no-new-privileges:true`, the read-only dedicated resolver bind
+at `/etc/resolv.conf`, and no helper host-port publications. Preserve its other
+approved mounts and security settings. Do not delete volumes, reset
+authentication, widen bindings or relax these protections.
+
+Verify actual shared networking, not just Compose configuration: using the same
+prefix, compare `exec -T app readlink /proc/self/ns/net` with
+`exec -T chromium readlink /proc/self/ns/net`. The namespace identities must
+match. An **Up** status or a `NetworkMode` string alone is not proof.
+Do not require a generated hostname to equal a container ID.
+
+Capture only the app's configured `NOISE_BROWSER_WS` privately: operator code
+may capture one-key `printenv NOISE_BROWSER_WS` output without logging it.
+Never dump the full environment or query credentials. In the examples below,
+`reviewed_compose` is an operator-defined command wrapper for the **complete
+reviewed prefix above**, not a bare/default Compose invocation. Disable shell
+tracing and do not log endpoint capture or pipeline contents. Check TCP
+reachability from the **app** namespace with its installed Python:
+
+```sh
+reviewed_compose exec -T app python3 -c '
+import os, socket, sys
+from urllib.parse import urlsplit
+try:
+    endpoint = urlsplit(os.environ["NOISE_BROWSER_WS"])
+    if endpoint.scheme not in ("ws", "wss") or not endpoint.hostname:
+        raise ValueError()
+    port = endpoint.port or (443 if endpoint.scheme == "wss" else 80)
+    with socket.create_connection((endpoint.hostname, port), timeout=5):
+        pass
+except Exception:
+    sys.exit(1)
+'
+```
+
+This reports only an exit status, never the endpoint. After the actual namespace
+match and TCP check, run the pinned
+client at `/opt/noise-browser/node_modules/playwright` **inside Chromium**
+against that configured endpoint; the app image deliberately does not contain
+this Node Playwright package. Pass the endpoint through private stdin, not
+credential-bearing arguments. The following client code runs inside Chromium
+and produces no screenshot file or raw error output:
+
+```js
+(async () => {
+  const { chromium } = require('/opt/noise-browser/node_modules/playwright');
+  const endpoint = require('node:fs').readFileSync(0, 'utf8').trim();
+  const browser = await chromium.connect(endpoint, { timeout: 5000 });
+  try {
+    const context = await browser.newContext();
+    context.setDefaultTimeout(5000);
+    const page = await context.newPage();
+    await page.setContent('<h1>Browser maintenance probe</h1>');
+    if (await page.locator('h1').textContent() !== 'Browser maintenance probe')
+      throw new Error('render failed');
+    const png = await page.screenshot({ type: 'png' });
+    if (!png.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])))
+      throw new Error('PNG failed');
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+})().catch(() => { process.exitCode = 1; });
+```
+
+Put that nonsecret JavaScript source in the operator's `browser_probe` shell
+variable, then pass the endpoint privately through this reviewed-prefix
+pipeline. Use `node -e`, not `node -`: stdin carries the endpoint, not the code.
+
+```sh
+reviewed_compose exec -T app printenv NOISE_BROWSER_WS |
+  reviewed_compose exec -T chromium node -e "$browser_probe"
+```
+
+Use only fresh synthetic `setContent`/data-page content: no external navigation
+or private pages, and PNG bytes remain in memory. A TCP check alone does not
+prove browser rendering. Keep credentials and private contents out of logs and
+artifacts. If these checks fail, retain the failure and investigate the selected
+topology; do not repeat app restarts or change authentication.
+
 ## Acceptance and rollout
 
 Run `pnpm test:project-preview` and `pnpm test:project-preview:managed` from
