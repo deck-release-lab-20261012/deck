@@ -1,22 +1,35 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+
+// Publish whole inbox snapshots while the follower and test assertions read them.
+async function writeInbox(file, inbox) {
+  const temporary = file + "." + randomUUID() + ".tmp";
+  try {
+    await writeFile(temporary, JSON.stringify(inbox));
+    await rename(temporary, file);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
 
 // A stand-in for the a2a CLI: records every invocation, answers `inbox` from
 // a fixture file, and succeeds on everything else.
 async function fakeA2A(root, inbox) {
   const capture = path.join(root, "calls.jsonl");
   const helper = path.join(root, "a2a.py");
-  await writeFile(path.join(root, "inbox.json"), JSON.stringify(inbox));
+  await writeInbox(path.join(root, "inbox.json"), inbox);
   await writeFile(
     helper,
     [
-      "import json, os, sys",
+      "import json, os, sys, tempfile",
       "args = sys.argv[1:]",
       "with open(os.environ['A2A_TEST_CAPTURE'], 'a', encoding='utf-8') as stream:",
       "    stream.write(json.dumps({'args': args, 'stdin': sys.stdin.read()}) + '\\n')",
@@ -26,7 +39,10 @@ async function fakeA2A(root, inbox) {
       "    if os.path.exists(os.environ['A2A_TEST_ACK_FAILS']):",
       "        sys.exit(1)",
       "    kept = [e for e in json.load(open(os.environ['A2A_TEST_INBOX'])) if e['id'] not in args[1:]]",
-      "    json.dump(kept, open(os.environ['A2A_TEST_INBOX'], 'w'))",
+      "    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=os.path.dirname(os.environ['A2A_TEST_INBOX']), delete=False) as stream:",
+      "        json.dump(kept, stream)",
+      "        temporary = stream.name",
+      "    os.replace(temporary, os.environ['A2A_TEST_INBOX'])",
     ].join("\n"),
   );
   return { helper, capture };
@@ -80,6 +96,44 @@ const session = (extra = {}) => ({
     getCwd: () => "/workspace/deck",
   },
   ...extra,
+});
+
+test("fake acknowledgement publishes a complete inbox snapshot atomically", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "deck-a2a-pi-"));
+  try {
+    const inbox = [{ id: "evt_atomic", body: "synthetic" }];
+    const { helper, capture } = await fakeA2A(root, inbox);
+    const file = path.join(root, "inbox.json");
+    // Read the live inbox from inside json.dump after a partial write. This
+    // deterministically catches truncating the published path before writing.
+    const instrument = [
+      "import json, os, runpy, sys",
+      "inbox = os.environ['A2A_TEST_INBOX']",
+      "with open(inbox) as stream: original = json.load(stream)",
+      "def partial_dump(value, stream):",
+      "    encoded = json.dumps(value)",
+      "    with open(inbox) as live: assert json.load(live) == original",
+      "    split = max(1, len(encoded) // 2)",
+      "    stream.write(encoded[:split])",
+      "    stream.flush()",
+      "    with open(inbox) as live: assert json.load(live) == original",
+      "    stream.write(encoded[split:])",
+      "json.dump = partial_dump",
+      "helper = sys.argv[1]",
+      "sys.argv = sys.argv[1:]",
+      "runpy.run_path(helper, run_name='__main__')",
+    ].join("\n");
+    const result = spawnSync(process.env.PYTHON ?? "python3", ["-B", "-c", instrument, helper, "mark-read", "evt_atomic"], {
+      input: "", encoding: "utf8", timeout: 5000,
+      env: { ...process.env, A2A_TEST_INBOX: file, A2A_TEST_CAPTURE: capture, A2A_TEST_ACK_FAILS: path.join(root, "ack-fails") },
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(await readFile(file, "utf8")), []);
+    assert.deepEqual(JSON.parse((await readFile(capture, "utf8")).trim()).args, ["mark-read", "evt_atomic"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("lifecycle events announce presence with the bounded payload", async () => {
@@ -149,7 +203,7 @@ test("an unverified or unreadable record is never delivered nor acknowledged", a
     assert.doesNotMatch(delivered[0].text, /closed|refused|does not open/);
     assert.deepEqual((await calls()).filter((c) => c.args[0] === "mark-read").map((c) => c.args), [["mark-read", "evt_ok"]]);
     // Only diagnostics left: no hand-off and no acknowledgement, poll after poll.
-    await writeFile(path.join(root, "inbox.json"), JSON.stringify(inbox.slice(0, 2)));
+    await writeInbox(path.join(root, "inbox.json"), inbox.slice(0, 2));
     const before = (await calls()).length;
     assert.equal(await api.poll(ctx), false);
     assert.equal(await api.poll(ctx), false);
@@ -175,7 +229,7 @@ test("the same box under another relay row is one hand-off, and its acknowledgem
     assert.equal(delivered.length, 1);
     // The fold now keeps an identical copy of the box under a new row; the
     // acknowledgement is still outstanding.
-    await writeFile(path.join(root, "inbox.json"), JSON.stringify([{ ...inbox[0], id: "evt_copy" }]));
+    await writeInbox(path.join(root, "inbox.json"), [{ ...inbox[0], id: "evt_copy" }]);
     assert.equal(await api.poll(ctx), false, "no second hand-off for the same box");
     assert.equal(delivered.length, 1);
     await rm(process.env.A2A_TEST_ACK_FAILS, { force: true });
@@ -357,7 +411,7 @@ test("mail that arrived while the agent was busy is delivered after agent_end, n
     sender.sendUserMessage = (text) => delivered.push(text);
     await handlers.get("session_start")({}, ctx);
     await handlers.get("agent_start")({}, ctx);
-    await writeFile(process.env.A2A_TEST_INBOX, JSON.stringify([{ id: "evt_5", from_agent: "alice", correlation_id: "chat-5", type: "chat.message", body: "while busy" }]));
+    await writeInbox(process.env.A2A_TEST_INBOX, [{ id: "evt_5", from_agent: "alice", correlation_id: "chat-5", type: "chat.message", body: "while busy" }]);
     assert.equal(await api.poll(ctx), false, "not delivered mid-turn");
     await handlers.get("agent_end")({}, ctx);
     const stop = (await calls()).find((c) => c.args[0] === "hook" && c.args[1] === "stop");
