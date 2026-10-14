@@ -217,6 +217,9 @@ try {
   // The retained screen of session-1's dead pane, served as bytes to the
   // resume-ended card. Fixture text, never interpreted by the app.
   let sessionOneScreen = null;
+  // A title marker proves the ordinary status response reached renderChrome,
+  // which runs after refreshOpenPopover; response arrival alone is too early.
+  let moreMenuRefreshProbe = null;
   let sessionTwoStatus = "running";
   let sessionTwoPresentationState = "running";
   let sessionTwoDetailFailures = 0;
@@ -525,7 +528,11 @@ try {
           sessionTwoDetailFailures--;
           return json(503, { error: "temporarily_unavailable", message: "session detail unavailable" });
         }
-        return json(200, detail(summary));
+        const session = detail(summary);
+        if (summary.id === "session-1" && moreMenuRefreshProbe !== null) {
+          session.display_name = `More menu refresh ${++moreMenuRefreshProbe}`;
+        }
+        return json(200, session);
       }
       if (request.method() === "GET" && path === `/api/sessions/${summary.id}/messages`) {
         // Guard: the direct-terminal live app must never query the retired
@@ -1389,6 +1396,41 @@ try {
   await waitForCondition(async () =>
     (await toggleColor(page.locator("[data-confirm-before-closing]")))
       .includes("text-primary"), "settings read reaching the menu");
+  // Keep real action targets through two ordinary polling/render cycles.
+  // Unconditional menu replacement detaches both handles and loses focus.
+  const retainedMoreMenu = await page.locator("[data-more-popover]").elementHandle();
+  const retainedLogout = await page.locator("[data-more-popover] [data-live-logout]").elementHandle();
+  assert.ok(retainedMoreMenu); assert.ok(retainedLogout);
+  await retainedLogout.focus();
+  moreMenuRefreshProbe = 0;
+  try {
+    for (let cycle = 1; cycle <= 2; cycle++) {
+      const response = await page.waitForResponse(async response =>
+        response.request().method() === "GET"
+          && new URL(response.url()).pathname === "/api/sessions/session-1"
+          && response.status() === 200
+          && (await response.json()).display_name === `More menu refresh ${cycle}`,
+      { timeout: 12_000 });
+      const session = await response.json();
+      assert.equal(session.display_name, `More menu refresh ${cycle}`);
+      await page.waitForFunction(title =>
+        document.querySelector("[data-titlebar-title]")?.textContent === title,
+      session.display_name, { timeout: 12_000 });
+      assert.deepEqual(await page.evaluate(({ menu, logout }) => ({
+        menuConnected: menu.isConnected,
+        logoutConnected: logout.isConnected,
+        sameMenu: document.querySelector("[data-more-popover]") === menu,
+        sameLogout: document.querySelector("[data-more-popover] [data-live-logout]") === logout,
+        movedFocusRetained: document.activeElement === logout,
+      }), { menu: retainedMoreMenu, logout: retainedLogout }), {
+        menuConnected: true, logoutConnected: true, sameMenu: true,
+        sameLogout: true, movedFocusRetained: true,
+      }, "unchanged status render detached the More menu or stole moved focus");
+    }
+  } finally {
+    moreMenuRefreshProbe = null;
+    await retainedMoreMenu.dispose(); await retainedLogout.dispose();
+  }
   const confirmBeforeClosing = page.locator("[data-confirm-before-closing]");
   const showInfoBar = page.locator("[data-show-info-bar]");
   assert.ok((await toggleColor(confirmBeforeClosing)).includes("text-primary"),

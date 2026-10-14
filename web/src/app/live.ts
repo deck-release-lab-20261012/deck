@@ -1663,9 +1663,15 @@ export class LiveWorkspace {
     });
     const menu = popovers.querySelector<HTMLElement>("[data-more-popover]");
     if (menu === null) return;
+    this.positionMoreMenu(menu, rect);
+  }
+
+  private positionMoreMenu(menu: HTMLElement, rect: DOMRect): void {
     menu.style.top = `${rect.bottom + 6}px`;
     menu.style.left = `${Math.max(8, rect.right - menu.offsetWidth)}px`;
   }
+
+  private moreMenuRender: { html: string; node: HTMLElement } | null = null;
 
   // moreFocus is the control the More menu should focus once mounted, held
   // as intent rather than applied at the call site: the menu remounts on
@@ -1709,6 +1715,7 @@ export class LiveWorkspace {
     this.popoverOpen = null;
     this.themeFlyoutOpen = false;
     this.moreFocus = null;
+    this.moreMenuRender = null;
     // After auth teardown the root no longer carries workspace regions;
     // cleanup must be a no-op there, not a throw.
     this.root.querySelector('[data-region="popovers"]')?.replaceChildren();
@@ -1744,7 +1751,7 @@ export class LiveWorkspace {
     this.popoverOpen = "more";
     const trigger = this.root.querySelector<HTMLElement>("[data-live-more]");
     if (trigger === null) return;
-    this.anchorPopover(sessionMenuHtml({
+    const html = sessionMenuHtml({
       workspaceSecurity: this.security?.lock !== undefined,
       workspaceMethods: this.security?.manageMethods !== undefined,
       fontSize: terminalFontSize(),
@@ -1758,9 +1765,18 @@ export class LiveWorkspace {
       confirmingYolo: this.confirmingYolo,
       skipCloseConfirm: this.skipCloseConfirm,
       skipRemoveProjectConfirm: this.skipRemoveProjectConfirm,
-    }), trigger.getBoundingClientRect());
-    const menu = this.root.querySelector<HTMLElement>('[data-region="popovers"] [data-more-popover]');
-    if (menu === null) return;
+    });
+    const popovers = region(this.root, "popovers");
+    const current = popovers.querySelector<HTMLElement>("[data-more-popover]");
+    // Polling and unchanged settings must not detach a control mid-gesture.
+    // Another menu can take over the shared popover region.
+    const reuse = this.moreMenuRender?.html === html
+      && this.moreMenuRender.node.isConnected && current === this.moreMenuRender.node;
+    if (!reuse) this.anchorPopover(html, trigger.getBoundingClientRect());
+    const menu = popovers.querySelector<HTMLElement>("[data-more-popover]");
+    if (menu === null) { this.moreMenuRender = null; return; }
+    if (reuse) this.positionMoreMenu(menu, trigger.getBoundingClientRect());
+    else this.moreMenuRender = { html, node: menu };
     // Read fresh whenever the menu opens: the backend is the authority,
     // and a cached copy could show a mode the next launch does not use.
     if (this.skipPermissions === null || this.skipCloseConfirm === null || this.skipRemoveProjectConfirm === null) {
@@ -1771,6 +1787,11 @@ export class LiveWorkspace {
         this.setSkipRemoveProjectConfirm(s.skip_remove_project_confirm);
         this.openMore();
       }).catch((cause) => this.handleError("settings read failed", cause));
+    }
+    if (reuse) {
+      // Retain handlers and operator focus, including a pending action's
+      // disabled control; rewiring would duplicate the action.
+      return;
     }
     // Each toggle row is a button.menuitem whose whole surface is the hit
     // target; state is the label colour alone, so there is no inner switch
