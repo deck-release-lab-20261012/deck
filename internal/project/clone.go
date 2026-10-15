@@ -488,8 +488,11 @@ func (c *Cloner) execute(ctx context.Context, run *cloneRun) {
 		c.finish(ctx, run, fmt.Errorf("%w: %s: no destination held", ErrInvalidDir, run.job.Destination))
 		return
 	}
-	cmd := exec.CommandContext(ctx, c.git, "clone", "--progress", "--", run.job.URL, ".")
-	cmd.Dir = workingDirectoryOf(run.anchor.leaf, run.job.Destination)
+	cmd, err := newCloneCommand(ctx, c.git, run.job.URL, run.job.Destination, run.anchor.leaf)
+	if err != nil {
+		c.finish(ctx, run, err)
+		return
+	}
 	// git spawns helpers (ssh, git-remote-https, pack readers) that inherit
 	// its pipes; a cancel kills the whole group, or a helper would hold the
 	// progress pipe open and the job would never report stopped.
@@ -514,7 +517,7 @@ func (c *Cloner) execute(ctx context.Context, run *cloneRun) {
 		c.finish(ctx, run, err)
 		return
 	}
-	err := cmd.Wait()
+	err = cmd.Wait()
 	// Wait has stopped the copy into the writer, so the fragment after
 	// the last terminator — git's final diagnostic often has none — is
 	// recorded here without racing a live write.

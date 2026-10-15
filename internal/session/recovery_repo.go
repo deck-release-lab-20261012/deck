@@ -104,12 +104,17 @@ func (r *Repository) BeginSuccessorSlot(ctx context.Context, source *Session,
 	candidateGeneration := source.Generation + 1
 	var captureHash *string
 	if grant != nil {
-		expectedSource := hookcapture.ExpectedSourceResume
-		if assignedNativeID != "" {
-			expectedSource = hookcapture.ExpectedSourceStartup
-		}
-		if !validIdentityCaptureGrant(*grant) ||
-			grant.ExpectedSource != expectedSource ||
+		// A resume candidate's grant is whichever shape the provider's
+		// callback actually emits: claude attests a resume-shaped source,
+		// while omp's session_start redelivers the resumed id with the
+		// startup source a fresh launch posts. The flight prepared the
+		// grant a few lines above, so both shapes are admitted here and the
+		// exact assignment rule below stays strict: a fresh assigned
+		// candidate takes a startup grant and no prior identity.
+		freshSource := assignedNativeID != ""
+		sourceOK := grant.ExpectedSource == hookcapture.ExpectedSourceStartup ||
+			(!freshSource && grant.ExpectedSource == hookcapture.ExpectedSourceResume)
+		if !validIdentityCaptureGrant(*grant) || !sourceOK ||
 			grant.SessionID != source.ID || grant.Provider != source.Provider ||
 			grant.Generation != candidateGeneration || grant.IdentityMarker != marker {
 			return nil, ErrInvalidRecoveryCandidate
@@ -325,6 +330,85 @@ func (r *Repository) RetireSuccessorSlot(ctx context.Context, slot *SuccessorSlo
 		})
 	})
 	return retired, err
+}
+
+// ReturnAbortedRecoveryOpportunity retires the slot and hands back the
+// spent admission when DECK stopped a recovery before the provider answered
+// — the sweep budget expiring mid-flight, or a shutdown. The slot removal
+// and the reopened opportunity land in one transaction, and the automatic
+// recovery series count is deliberately untouched: every re-admission
+// counts another attempt, so a schedule that keeps aborting recoveries
+// still runs into the two-in-ten-minutes bound instead of retrying forever.
+//
+// The identity the admission allocated is undone with the same stroke: a
+// fresh candidate's assigned uuid is burned by an unlaunched flight, and a
+// row left carrying it would RESUME an id the provider has never seen
+// instead of relaunching fresh. priorNativeID is the identity the row
+// carried before this admission — NULL for a fresh candidate, the recorded
+// conversation id for a resume — and it is what the row goes back to.
+//
+// A provider's answer never passes through here. A refused resume, a gone
+// store, or an executable that will not run tells the operator something
+// about the session, and its opportunity stays spent; only a flight that
+// asked nothing and learned nothing gives the attempt back.
+func (r *Repository) ReturnAbortedRecoveryOpportunity(ctx context.Context,
+	slot *SuccessorSlot, priorNativeID *string, detail string) (bool, error) {
+	if slot == nil {
+		return false, ErrInvalidRecoveryCandidate
+	}
+	if detail == "" {
+		detail = "automatic recovery aborted before the provider answered; opportunity returned"
+	}
+	var restoreNativeID any
+	if priorNativeID != nil {
+		restoreNativeID = *priorNativeID
+	}
+	returned := false
+	err := r.db.WithTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			DELETE FROM session_successor_slots
+			WHERE session_id = ? AND source_generation = ?
+			  AND source_controller_revision = ? AND candidate_generation = ?
+			  AND candidate_identity_marker = ?`, slot.SessionID,
+			slot.SourceGeneration, slot.SourceControllerRevision,
+			slot.CandidateGeneration, slot.CandidateIdentityMarker)
+		if err != nil {
+			return fmt.Errorf("session %s: return aborted recovery: %w", slot.SessionID, err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			// The slot is already gone: a commit, a refusal, or another
+			// unwind owned it, and none of them may be reopened here.
+			return nil
+		}
+		// The CAS matches exactly the row BeginSuccessorSlot wrote — the
+		// candidate generation and marker — so a row that moved on (a
+		// committed successor, an operator action) is never reopened.
+		res, err = tx.ExecContext(ctx, `
+			UPDATE sessions SET resume_attempts = 0, resume_next_at = NULL,
+				resume_series_started_at = NULL, native_session_id = ?,
+				updated_at = ?
+			WHERE id = ? AND removed_at IS NULL AND status IN (?, ?)
+			  AND generation = ? AND identity_marker = ? AND resume_attempts = 1`,
+			restoreNativeID, db.FormatTime(time.Now()), slot.SessionID,
+			StatusExited, StatusInterrupted,
+			slot.CandidateGeneration, slot.CandidateIdentityMarker)
+		if err != nil {
+			return fmt.Errorf("session %s: return aborted recovery opportunity: %w", slot.SessionID, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return nil
+		}
+		returned = true
+		return db.AppendAudit(ctx, tx, db.AuditEvent{
+			SessionID: &slot.SessionID, Type: AuditResumeAttempt,
+			Details: detail,
+		})
+	})
+	return returned, err
 }
 
 func (r *Repository) SuccessorSlot(ctx context.Context, sessionID string) (*SuccessorSlot, error) {

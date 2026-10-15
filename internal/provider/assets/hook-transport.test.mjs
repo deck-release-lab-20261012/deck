@@ -10,7 +10,11 @@ import test from "node:test"
 const token = "synthetic-hook-token-not-a-credential"
 const sessionID = "synthetic-native-session"
 const directory = "/synthetic/project with spaces/雪"
-const expectedBody = { hook_event_name: "SessionStart", session_id: sessionID, cwd: directory, source: "startup" }
+// omp's hook names its reporting process so the capture endpoint can reject
+// subagent session_starts; here that process is this test runner.
+const expectedBody = (name) => name === "omp"
+  ? { hook_event_name: "SessionStart", session_id: sessionID, cwd: directory, source: "startup", pid: String(process.pid) }
+  : { hook_event_name: "SessionStart", session_id: sessionID, cwd: directory, source: "startup" }
 
 async function loadHook(name, filename) {
   const raw = await readFile(new URL(filename, import.meta.url))
@@ -68,7 +72,7 @@ for (const [name, filename] of [["opencode", "opencode-hook.js"], ["kilo", "kilo
       assert.equal(request.path, "/api/hooks/capture?synthetic=1")
       assert.equal(request.headers["x-noisedeck-hook-token"], token)
       assert.equal(request.headers["content-type"], "application/json")
-      assert.deepEqual(JSON.parse(request.body), expectedBody)
+      assert.deepEqual(JSON.parse(request.body), expectedBody(name))
     }
     try {
       await t.test("configured socket carries exact payload without TCP", async () => {

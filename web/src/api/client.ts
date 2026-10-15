@@ -362,6 +362,10 @@ export interface FileEntry {
   size?: number;
   mode: string;
   mtime: string;
+  // change is set when git reports the entry differs from the last commit
+  // (a directory: when something inside it does). Absent means unchanged,
+  // or that git could not say.
+  change?: "modified" | "new";
 }
 
 // FileListing is one directory inside a project. parent is absent at the
@@ -599,6 +603,11 @@ export interface ApiClient {
   saveSettings(next: ConsoleSettings): Promise<ConsoleSettings>;
   getLayout(): Promise<SidebarLayout | null>;
   saveLayout(next: SidebarLayout): Promise<SidebarLayout>;
+  // The session the operator last opened, remembered on the server so a
+  // browser on another device opens the same one. Null when nothing is
+  // remembered; saving null forgets it.
+  getLastSession(): Promise<string | null>;
+  saveLastSession(id: string | null): Promise<void>;
   // The tutorial preference read: null when no record was ever written —
   // the UI's first-use signal. A stored record whose version this build
   // does not speak is served as read, so the caller can preserve it.
@@ -941,6 +950,23 @@ export class HttpApiClient implements ApiClient, FileApiClient {
         body: JSON.stringify(next),
       }),
     );
+  }
+
+  async getLastSession(): Promise<string | null> {
+    const resp = await this.get("/api/settings/last-session");
+    if (resp.status === 404) return null;
+    const doc = await readJSON<{ session_id: string }>(resp);
+    return doc.session_id === "" ? null : doc.session_id;
+  }
+
+  async saveLastSession(id: string | null): Promise<void> {
+    await this.request("/api/settings/last-session", {
+      method: "PUT",
+      headers: this.mutationHeaders(true),
+      credentials: "same-origin",
+      cache: "no-store",
+      body: JSON.stringify({ session_id: id ?? "" }),
+    });
   }
 
   async getTutorial(signal?: AbortSignal): Promise<TutorialRecord | null> {

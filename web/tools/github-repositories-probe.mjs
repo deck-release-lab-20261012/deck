@@ -232,6 +232,8 @@ try {
           contentType: "text/event-stream",
           body: ": fixture\n\n"
         });
+      if (path === "/api/settings/last-session" && req.method() === "PUT")
+        return json(req.postDataJSON(), 200);
       if (req.method() !== "GET")
         throw new Error(`Unexpected mutation ${path}`);
       return json({

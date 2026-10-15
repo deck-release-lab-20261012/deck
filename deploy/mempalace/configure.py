@@ -171,6 +171,7 @@ def remove_configuration() -> None:
         if path.exists():
             document = read_json(path)
             remove_hooks(document)
+            document.pop("crossSessionInbound", None)
             write_json(path, document)
 
     config_path = HOME / ".codex" / "config.toml"
@@ -231,6 +232,11 @@ def configure_claude() -> None:
 
     settings_path = HOME / ".claude" / "settings.json"
     settings = read_json(settings_path)
+    # Deck launches every Claude session with --dangerously-skip-permissions,
+    # and the default inbound rules hold a socket-posted message from a
+    # non-child process (the courier) behind an approval dialog nobody
+    # answers. Accept keeps the a2a socket rung automatic.
+    settings["crossSessionInbound"] = "accept"
     hook_root = "/opt/mempalace/hooks"
     add_hook(settings, "Stop", f"{hook_root}/mempal-stop-hook.sh")
     add_hook(settings, "SessionEnd", f"{hook_root}/mempal-session-end-hook.sh", 10)

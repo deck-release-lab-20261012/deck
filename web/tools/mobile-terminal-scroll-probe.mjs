@@ -115,6 +115,8 @@ async function runWidth(width, mobile, options = {}) {
       // The probe drives a single codex session and never opens the picker.
       return json(200, { providers: ["codex"] });
     }
+    if (request.method() === "GET" && path === "/api/settings/last-session") return json(404, { code: "not_found", message: "no last session remembered" });
+    if (request.method() === "PUT" && path === "/api/settings/last-session") return json(200, request.postDataJSON());
     if (request.method() === "GET" && path === "/api/settings/layout") return json(404, { code: "not_found", message: "no layout saved" });
     if (request.method() === "GET" && path === "/api/settings/tutorial") return json(200, { version: 1, dismissed: true, lesson: "welcome", step: 0, done: [], scope: "operator" });
     if (request.method() === "GET" && path === "/api/settings") {

@@ -123,6 +123,7 @@ try {
       return json(preference ? 200 : 404, preference ?? { code: "not_found" });
     }
     if (path === "/api/settings/layout") return json(method === "PUT" ? 200 : 404, method === "PUT" ? request.postDataJSON() : { code: "not_found" });
+    if (path === "/api/settings/last-session") return json(method === "PUT" ? 200 : 404, method === "PUT" ? request.postDataJSON() : { code: "not_found" });
     if (path === "/api/settings") return json(200, { skip_permissions: false, skip_close_confirm: false, skip_remove_project_confirm: false });
     if (path === "/api/git-identities") return json(200, { profiles: [identity], default_profile_id: identity.id, revision: 1 });
     if (path === "/api/providers") return json(200, { providers: ["shell", "claude", "codex"] });

@@ -1,10 +1,12 @@
 // Command noisedeck-harness-bump moves the agent harness pins the image
-// carries (ADR-0010). It never merges anything: the daily workflow runs it,
+// carries (ADR-0010). It never merges anything: the scheduled workflow runs it,
 // builds the image, and opens a pull request with the report.
 //
 //	noisedeck-harness-bump list
+//	noisedeck-harness-bump model-plan [-root DIR] [-codex PATH] [-claude PATH] [-files]
 //	noisedeck-harness-bump check [-json] [-root DIR]
 //	noisedeck-harness-bump batch [-root DIR]
+//	noisedeck-harness-bump drop -harness NAME -reason TEXT -batch FILE [-root DIR]
 //	noisedeck-harness-bump verify-batch -head SHA -id ID [-root DIR]
 //	noisedeck-harness-bump apply -harness NAME [-version V] [-json] [-root DIR]
 //	noisedeck-harness-bump probe -harness NAME -image IMAGE [-root DIR]
@@ -31,6 +33,7 @@ import (
 	"time"
 
 	"github.com/noisefloor-oss/deck/internal/harnessbump"
+	"github.com/noisefloor-oss/deck/internal/modelbump"
 )
 
 func main() {
@@ -48,7 +51,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 
 func runContext(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: noisedeck-harness-bump list|check|apply|batch|verify-batch|probe|settle|broker|verdict|jail-dial")
+		return errors.New("usage: noisedeck-harness-bump list|check|apply|batch|drop|model-plan|verify-batch|probe|settle|broker|verdict|jail-dial")
 	}
 	switch args[0] {
 	case "list":
@@ -71,6 +74,43 @@ func runContext(ctx context.Context, args []string, stdout, stderr io.Writer) er
 			return err
 		}
 		return json.NewEncoder(stdout).Encode(result)
+	case "drop":
+		return drop(args[1:], stdout)
+	case "model-plan":
+		fs := flag.NewFlagSet("model-plan", flag.ContinueOnError)
+		root := fs.String("root", ".", "repository root")
+		codex := fs.String("codex", "codex", "codex CLI executable for catalog discovery")
+		claude := fs.String("claude", "claude", "claude CLI executable for membership probes")
+		files := fs.Bool("files", false, "include the planned file contents in the JSON output")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		truth, err := modelbump.ReadTruth(*root)
+		if err != nil {
+			return err
+		}
+		plan, err := modelbump.Discover(ctx, truth, *codex, *claude, modelbump.CodexCatalog, modelbump.ClaudeMember)
+		if err != nil {
+			return err
+		}
+		out := struct {
+			modelbump.Plan
+			Files   map[string][]byte `json:"files,omitempty"`
+			Sources map[string]string `json:"sources,omitempty"`
+		}{Plan: plan}
+		if *files {
+			planFiles, err := modelbump.Files(*root, plan.Offers)
+			if err != nil {
+				return err
+			}
+			out.Files = map[string][]byte{}
+			out.Sources = map[string]string{}
+			for path, planned := range planFiles {
+				out.Files[path] = planned.Body
+				out.Sources[path] = planned.SourceSHA
+			}
+		}
+		return json.NewEncoder(stdout).Encode(out)
 	case "verify-batch":
 		fs := flag.NewFlagSet("verify-batch", flag.ContinueOnError)
 		root := fs.String("root", ".", "trusted repository root")
@@ -151,6 +191,42 @@ func reviewProxy(ctx context.Context, args []string) error {
 		return err
 	}
 	return nil
+}
+
+// drop returns one harness to its pre-batch pin after its gates failed and
+// rewrites the batch report, so the rest of the batch still ships.
+func drop(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("drop", flag.ContinueOnError)
+	root := fs.String("root", ".", "repository root")
+	name := fs.String("harness", "", "harness to return to its pre-batch pin")
+	reason := fs.String("reason", "", "why the harness leaves the batch")
+	batchFile := fs.String("batch", "", "batch report to update in place")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *name == "" || *reason == "" || *batchFile == "" {
+		return errors.New("drop requires -harness, -reason and -batch")
+	}
+	raw, err := os.ReadFile(*batchFile)
+	if err != nil {
+		return err
+	}
+	var result harnessbump.BatchResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return fmt.Errorf("batch report %s: %w", *batchFile, err)
+	}
+	if err := harnessbump.Drop(*root, &result, *name, *reason); err != nil {
+		return err
+	}
+	out, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(*batchFile, append(out, '\n'), 0o600); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(stdout, "dropped %s; batch %s ships %d update(s)\n", *name, result.ID, len(result.Updated))
+	return err
 }
 
 func check(ctx context.Context, args []string, stdout io.Writer) error {

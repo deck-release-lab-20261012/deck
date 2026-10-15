@@ -4,9 +4,28 @@ package tmux
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestDarwinProcessPathMatchesExecutable(t *testing.T) {
+	want, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err = filepath.EvalSymlinks(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := darwinProcessPath(os.Getpid())
+	if err != nil || got != want {
+		t.Fatalf("process path = %q, %v; want %q", got, err, want)
+	}
+	if _, err := darwinProcessPath(1<<22 + 12345); err == nil {
+		t.Fatal("absent process path accepted")
+	}
+}
 
 func childTicks(t *testing.T, pid int) int64 {
 	t.Helper()

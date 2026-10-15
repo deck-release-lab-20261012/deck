@@ -68,7 +68,7 @@ func TestCodexDelegatedLaunchCarriesMeasuredModelAndPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDelegatedSessionArgs: %v", err)
 	}
-	want := []string{d.Executable(), "--no-daemon", "--model", "gpt-5.6-sol", "accept task 295"}
+	want := []string{d.Executable(), "--no-daemon", "--no-alt-screen", "--model", "gpt-5.6-sol", "accept task 295"}
 	if strings.Join(argv, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("argv = %q, want %q", argv, want)
 	}
@@ -370,7 +370,7 @@ func assertHookIdentity(t *testing.T, d hookProvider) {
 	}
 	want := []string{d.Executable()}
 	if d.Name() == Codex {
-		want = append(want, "--no-daemon")
+		want = append(want, "--no-daemon", "--no-alt-screen")
 	}
 	if strings.Join(argv, "\x00") != strings.Join(want, "\x00") {
 		t.Errorf("argv = %q, want %q", argv, want)

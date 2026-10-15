@@ -10,6 +10,7 @@ export const OPEN_DIRECTORY_AS_PROJECT = "A path on this machine, or a repositor
 export const OPEN_PROJECTS_MENU = "Add, sort, expand or collapse projects";
 export const START_NEW_SESSION = "Start a new session";
 export const ADD_WORKSPACE_DIRECTORY_AS_PROJECT = "A path on this machine, or a repository to clone";
+export const RETRY_REACHING_THE_RUNTIME = "Ask the runtime for the session list again";
 export const SORT_PROJECTS_BY_NAME = "Reorder the projects A to Z";
 export const EXPAND_ALL_PROJECTS = "Show every project's sessions";
 export const COLLAPSE_ALL_PROJECTS = "Hide every project's sessions";

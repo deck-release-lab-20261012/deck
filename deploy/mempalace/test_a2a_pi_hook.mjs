@@ -32,7 +32,24 @@ async function fakeA2A(root, inbox) {
       "import json, os, sys, tempfile",
       "args = sys.argv[1:]",
       "with open(os.environ['A2A_TEST_CAPTURE'], 'a', encoding='utf-8') as stream:",
-      "    stream.write(json.dumps({'args': args, 'stdin': sys.stdin.read()}) + '\\n')",
+      // A follower child holds stdin open as its death signal and must not block on it.
+      "    _stdin = '' if '--follow' in args else sys.stdin.read()",
+      "    stream.write(json.dumps({'args': args, 'stdin': _stdin}) + '\\n')",
+      "if args[:1] == ['inbox'] and '--follow' in args:",
+      "    import os as _os, time as _t",
+      "    _root = _os.path.dirname(_os.environ['A2A_TEST_INBOX'])",
+      "    open(_os.path.join(_root, 'follow-pid'), 'w').write(str(_os.getpid()))",
+      "    _last = None",
+      "    while True:",
+      "        try: _doc = open(_os.environ['A2A_TEST_INBOX']).read().strip()",
+      "        except OSError: _doc = '[]'",
+      "        if _doc != _last:",
+      "            _last = _doc",
+      "            sys.stdout.write(_doc + '\\n')",
+      "            sys.stdout.flush()",
+      "            with open(_os.path.join(_root, 'follow-lines'), 'a') as _f:",
+      "                _f.write(_doc + '\\n')",
+      "        _t.sleep(0.02)",
       "if args[:1] == ['inbox']:",
       "    print(open(os.environ['A2A_TEST_INBOX']).read())",
       "if args[:1] == ['mark-read']:",
@@ -48,7 +65,37 @@ async function fakeA2A(root, inbox) {
   return { helper, capture };
 }
 
-async function load(root, inbox) {
+// Awaits an observable with a deadline so follower-driven tests never
+// depend on timer racing.
+async function until(check, label = "condition", ms = 5000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`timed out waiting for ${label}`);
+}
+
+// Follower children write marker files into the root; teardown waits out
+// any restart-backoff child and retries the removal so a late write cannot
+// fail the suite with ENOTEMPTY.
+async function rmRoot(root, follow = false) {
+  if (follow) {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const pidText = (await readFile(path.join(root, "follow-pid"), "utf8").catch(() => "")).trim();
+      let dead = true;
+      if (pidText && !Number.isNaN(Number(pidText))) {
+        try { process.kill(Number(pidText), 0); dead = false; } catch { dead = true; }
+      }
+      if (dead) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+}
+
+async function load(root, inbox, { follow = false } = {}) {
   const { helper, capture } = await fakeA2A(root, inbox);
   process.env.A2A_BIN = helper;
   process.env.NOISEDECK_MEMPALACE_PYTHON = process.env.PYTHON ?? "python3";
@@ -56,6 +103,10 @@ async function load(root, inbox) {
   process.env.A2A_TEST_INBOX = path.join(root, "inbox.json");
   process.env.A2A_TEST_ACK_FAILS = path.join(root, "ack-fails");
   process.env.A2A_PI_POLL_MS = "3600000";
+  // Interval-mode tests drive delivery through api.poll; follower tests opt
+  // in and await the follower's own lines instead.
+  if (follow) delete process.env.A2A_PI_FOLLOW;
+  else process.env.A2A_PI_FOLLOW = "0";
   delete process.env.NOISEDECK_MEMPALACE_HARNESS;
   const module = await import(
     `${pathToFileURL(path.join(here, "hooks", "a2a-pi-hook.js"))}?test=${Date.now()}-${Math.random()}`
@@ -132,7 +183,7 @@ test("fake acknowledgement publishes a complete inbox snapshot atomically", asyn
     assert.deepEqual(JSON.parse(await readFile(file, "utf8")), []);
     assert.deepEqual(JSON.parse((await readFile(capture, "utf8")).trim()).args, ["mark-read", "evt_atomic"]);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rmRoot(root);
   }
 });
 
@@ -159,7 +210,7 @@ test("lifecycle events announce presence with the bounded payload", async () => 
       assert.deepEqual(JSON.parse(call.stdin), { session_id: "pi-session", cwd: "/workspace/deck" });
     }
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rmRoot(root, true);
   }
 });
 
@@ -180,7 +231,7 @@ test("an idle agent receives unread mail through the extension API and only then
     assert.deepEqual(order, ["hook", "inbox", "mark-read"]);
     assert.deepEqual((await calls()).at(-1).args, ["mark-read", "evt_1"]);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rmRoot(root, true);
   }
 });
 
@@ -210,7 +261,7 @@ test("an unverified or unreadable record is never delivered nor acknowledged", a
     assert.equal(delivered.length, 1);
     assert.ok(!(await calls()).slice(before).some((c) => c.args[0] === "mark-read"), "nothing acknowledged");
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rmRoot(root, true);
   }
 });
 
@@ -240,7 +291,7 @@ test("the same box under another relay row is one hand-off, and its acknowledgem
     assert.equal(await api.poll(ctx), false);
     assert.equal(delivered.length, 1);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rmRoot(root, true);
   }
 });
 
@@ -258,7 +309,7 @@ test("a synchronous send failure leaves the message unread without retrying", as
     assert.equal(await api.poll(ctx), false, "uncertain send is not retried");
     assert.ok(!(await calls()).some((c) => c.args[0] === "mark-read"), "nothing acknowledged");
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rmRoot(root, true);
   }
 });
 
@@ -283,7 +334,7 @@ test("a failed acknowledgement is retried and never redelivers", async () => {
     assert.equal(acks.length, 3, "acknowledgement retried on every poll until it succeeds");
     assert.deepEqual(acks.at(-1).args, ["mark-read", "evt_4"]);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rmRoot(root, true);
   }
 });
 
@@ -398,7 +449,7 @@ test("a close-only follow-up is acknowledged once and never asks the agent to re
     assert.equal(delivered.length, 1);
     assert.deepEqual((await calls()).filter((c) => c.args[0] === "mark-read").map((c) => c.args), [["mark-read", "evt_closed"]]);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rmRoot(root, true);
   }
 });
 
@@ -419,7 +470,62 @@ test("mail that arrived while the agent was busy is delivered after agent_end, n
     assert.equal(await api.poll(ctx), true);
     assert.match(delivered[0], /alice \(chat-5\): while busy/);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rmRoot(root, true);
+  }
+});
+
+test("a stale gap peek never re-delivers a box the follower already handed off", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "deck-a2a-pi-"));
+  try {
+    const box = { id: "evt_9", from_agent: "alice", correlation_id: "chat-9", type: "chat.invite", body: "once only", scope: "chat-9|i" };
+    const { handlers, api, calls, sender } = await load(root, [box], { follow: true });
+    const delivered = [];
+    const ctx = session();
+    sender.sendUserMessage = (text) => delivered.push(text);
+    await handlers.get("session_start")({}, ctx);
+    // The follower's own line delivers, and the native receipt marks it read.
+    await until(() => delivered.length > 0, "follower delivery");
+    await until(async () => JSON.parse(await readFile(process.env.A2A_TEST_INBOX, "utf8")).length === 0, "mark-read");
+    assert.deepEqual((await calls()).filter((c) => c.args[0] === "mark-read").at(-1).args, ["mark-read", "evt_9"]);
+    // A gap peek's snapshot may predate the receipt and list the box again;
+    // the delivery history must refuse the second hand-off.
+    await writeInbox(process.env.A2A_TEST_INBOX, [box]);
+    assert.equal(await api.poll(ctx), false, "the stale snapshot delivers nothing");
+    assert.equal(delivered.length, 1);
+    await handlers.get("session_shutdown")({}, ctx);
+  } finally {
+    await rmRoot(root, true);
+  }
+});
+
+test("mail that arrived while the agent was busy is replayed to it at agent end in follower mode", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "deck-a2a-pi-"));
+  try {
+    const { handlers, api, calls, sender } = await load(root, [], { follow: true });
+    const delivered = [];
+    const ctx = session();
+    sender.sendUserMessage = (text) => delivered.push(text);
+    const lines = path.join(root, "follow-lines");
+    await handlers.get("session_start")({}, ctx);
+    await until(async () => (await readFile(path.join(root, "follow-pid"), "utf8").catch(() => "")) !== "", "follower running");
+    await handlers.get("agent_start")({}, ctx);
+    await writeInbox(process.env.A2A_TEST_INBOX, [{ id: "evt_7", from_agent: "bob", correlation_id: "chat-7", type: "chat.message", body: "while busy", scope: "chat-7|m" }]);
+    // The follower must have emitted the busy wake, and the extension must
+    // have consumed a busy snapshot without interrupting the turn: the poll
+    // returns false, nothing is submitted and nothing is acknowledged while
+    // the agent is busy.
+    await until(async () => (await readFile(lines, "utf8").catch(() => "")).includes("evt_7"), "the busy wake was emitted");
+    assert.equal(await api.poll(ctx), false, "a busy snapshot is never submitted");
+    assert.equal(delivered.length, 0, "never interrupted mid-turn");
+    assert.ok(!(await calls()).some((c) => c.args[0] === "mark-read"), "nothing acknowledged mid-turn");
+    // The buffered wake is replayed inside agent_end itself: delivery is
+    // complete by the time the handler returns, not on some later tick.
+    await handlers.get("agent_end")({}, ctx);
+    assert.equal(delivered.length, 1, "the replay happens within agent_end");
+    assert.match(delivered[0], /bob \(chat-7\): while busy/);
+    await handlers.get("session_shutdown")({}, ctx);
+  } finally {
+    await rmRoot(root, true);
   }
 });
 
@@ -438,7 +544,7 @@ test("a busy agent is not interrupted and an API without sendUserMessage is skip
     assert.equal(await api.poll(session()), false);
     assert.ok(!(await calls()).some((c) => c.args[0] === "inbox"), "the inbox is never even read");
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rmRoot(root, true);
   }
 });
 
@@ -464,6 +570,6 @@ test("void send without a native receipt leaves mail unread and cannot acknowled
     await handlers.get("before_agent_start")({ prompt: sent });
     assert.deepEqual((await calls()).filter((c) => c.args[0] === "mark-read").map((c) => c.args), [["mark-read", "evt_failed"]]);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rmRoot(root, true);
   }
 });

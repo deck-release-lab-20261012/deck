@@ -19,6 +19,7 @@ import {
   projectRowHtml,
   rowDropSlot,
   projectChevronHtml,
+  loadingBandsHtml,
   projectsHeaderHtml,
   reconcileCreatedProjectExpansion,
   sessionActionControlsHtml,
@@ -395,6 +396,30 @@ test("the lockup is the collapse control", () => {
 // casing is presentational via text-transform; losing it changes the measured
 // box and is a regression, so both are pinned alongside their size and line
 // box classes.
+// The unanswered rail (comp Workspace Loading State, 1a): bands at row
+// height, flat, with the eyebrow dimmed and no menu to open over a list
+// nobody has read. A syncing header says the rows below are the last known
+// list and carries no menu either: its rows act on a list nobody confirmed.
+test("the loading bands are flat rows at the real row height", () => {
+  const html = loadingBandsHtml();
+  assert.equal((html.match(/data-loading-band/g) ?? []).length, 4, "four project bands");
+  assert.equal((html.match(/h-\[31px\]/g) ?? []).length, 9, "every band is one row tall");
+  assert.ok(!/animate-|shimmer|pulse/.test(html), "bands neither shimmer nor pulse");
+  assert.ok(html.includes('aria-hidden="true"'), "bands say nothing to a reader");
+  assert.ok(!html.includes("data-list-row"), "a band is not a row the keyboard can reach");
+});
+
+test("the dimmed header has no menu and the syncing header says so", () => {
+  const dimmed = projectsHeaderHtml({ dimmed: true });
+  assert.ok(dimmed.includes("Projects") && !dimmed.includes("data-projects-menu"), "no menu over an unread list");
+  assert.ok(dimmed.includes("opacity-60"));
+  const syncing = projectsHeaderHtml({ syncing: true });
+  assert.ok(!syncing.includes("data-projects-menu"), "no menu over a stale list either: its rows act on a list nobody confirmed");
+  assert.ok(syncing.includes('data-list-syncing role="status"') && syncing.includes("Syncing"));
+  assert.ok(syncing.includes("animate-spinner"));
+  assert.ok(!projectsHeaderHtml().includes("data-list-syncing"), "a served list does not say syncing");
+});
+
 test("the projects header is a menubar-style menu button, with no standalone Open control", () => {
   const html = projectsHeaderHtml();
   const trigger = /<button data-projects-menu aria-haspopup="menu" aria-expanded="false"[\s\S]*?class="([^"]*)"/.exec(html);

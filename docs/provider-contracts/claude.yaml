@@ -19,11 +19,38 @@ runtime_compatibility:
 
 native_receive_probe:
   # Drives the real claude CLI against a synthetic a2a mailbox and a
-  # loopback model: the Stop-hook block that surfaces mail at turn end and
-  # the UserPromptSubmit stdout that surfaces it at the next turn's start.
+  # loopback model: the Stop-hook block that surfaces mail at turn end, the
+  # UserPromptSubmit stdout that surfaces it at the next turn's start, and
+  # the cross-session inbox socket that wakes an idle TUI session when the
+  # courier posts the wake line through it (the claude-socket rung).
   script: "probe_a2a_claude.py"
   network: none
-  timeout_s: 300
+  timeout_s: 600
+
+messaging_socket:
+  # Measured 2026-10-15 against the pinned 2.1.296, real TUI in a private
+  # tmux socket (probe_a2a_claude.py, claude-socket phase).
+  available_since: "2.1.224"
+  path_from_hook_env: "CLAUDE_CODE_MESSAGING_SOCKET"
+  # A plain absolute path (no uds: prefix), shaped
+  # /tmp/cc-socks-<uid>/<pid>.sock when XDG_RUNTIME_DIR is unset.
+  path_shape: "/tmp/cc-socks-<uid>/<pid>.sock"
+  # The wire is newline-delimited JSON. One post is one line:
+  #   {"type":"user","message":{"role":"user","content":"<text>"}}
+  # The auth line the docs describe is optional on Linux and was not sent.
+  wire: 'ndjson user message'
+  auth_line_needed_on_linux: false
+  # MEASURED: an idle session started a new turn containing the posted text
+  # with no terminal input. With crossSessionInbound unset and the session
+  # in bypass mode, the same post was HELD behind an approval dialog
+  # ("The sender did not attest its permission mode") and never reached the
+  # model; Deck sessions all run bypassed, so provisioning sets accept.
+  idle_turn_on_post: true
+  held_by_default_in_bypass_mode: true
+  inbound_accept_setting: "crossSessionInbound"
+  # While CLAUDE_CONFIG_DIR is set, the trust record moves with it:
+  # <config-dir>/.claude.json, not $HOME/.claude.json.
+  trust_record_follows_config_dir: true
 
 executable:
   # The command on PATH is a SYMLINK to a version-stamped binary:

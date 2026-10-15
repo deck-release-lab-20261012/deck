@@ -93,6 +93,13 @@ type Event struct {
 	// claude event it must derive a store root for the event's own session
 	// id, or the event is malformed.
 	TranscriptPath string `json:"transcript_path"`
+	// PID is the operating-system process id of the process whose hook is
+	// reporting, when the hook knows it. It is a process fact, not provider
+	// output: the capture store uses it to keep a child process from
+	// speaking for the pane — an omp subagent inherits the pane's capture
+	// token and fires its own session_start — and ignores it when a hook
+	// does not report one.
+	PID string `json:"pid"`
 }
 
 // Grant contains the non-secret correlation persisted before spawn. TokenHash

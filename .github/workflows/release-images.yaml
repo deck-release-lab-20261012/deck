@@ -12,6 +12,10 @@ permissions:
   actions: read
   packages: write
 
+env:
+  NOISE_TASKS_REPO: ${{ vars.NOISE_TASKS_REPO }}
+  NOISE_SDLC_REPO: ${{ vars.NOISE_SDLC_REPO }}
+
 # Publication is a transaction: never interrupt between previous and latest.
 concurrency:
   group: release-images

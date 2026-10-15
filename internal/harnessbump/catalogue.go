@@ -2,7 +2,7 @@
 // reads what the image ships, asks each upstream what it publishes, rewrites
 // the pin and everything that repeats it, and checks a built image against
 // the harness's behavioural contract. It decides nothing about shipping on
-// its own; the daily job opens a pull request and the settle workflow
+// its own; the scheduled job opens a pull request and the settle workflow
 // merges it once the verdict allows (ADR-0010).
 package harnessbump
 

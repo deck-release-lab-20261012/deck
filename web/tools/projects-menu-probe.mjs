@@ -145,6 +145,8 @@ try {
       // define the sensible fixture.
       return json(200, { providers: ["claude", "codex"] });
     }
+    if (request.method() === "GET" && path === "/api/settings/last-session") return json(404, { code: "not_found", message: "no last session remembered" });
+    if (request.method() === "PUT" && path === "/api/settings/last-session") return json(200, request.postDataJSON());
     if (request.method() === "GET" && path === "/api/settings/layout") return json(404, { code: "not_found", message: "no layout saved" });
     if (request.method() === "PUT" && path === "/api/settings/layout") return json(200, request.postDataJSON());
     if (request.method() === "GET" && path === "/api/settings/tutorial") return json(200, { version: 1, dismissed: true, lesson: "welcome", step: 0, done: [], scope: "operator" });
@@ -317,27 +319,70 @@ try {
   await renameInput.waitFor({ state: "detached" });
   console.log("ok: a full render dismisses the menu safely and hands focus to the rename field");
 
-  // ---- the unread registry ----
-  // A failed registry read is not an empty database: the pane renders
-  // its own unread state, and neither New project affordance — the
-  // pane's button nor the sidebar's row — renders until a read
-  // succeeds.
+  // ---- the failed registry read, with the last visit's list cached ----
+  // The successful reads above wrote the list to localStorage, so this
+  // reload draws it: stale, dimmed, inert (comp Workspace Loading State,
+  // 1b). The pane renders its own error state, says the rows on the left
+  // are from the last visit, and offers a retry. Nothing on the stale rail
+  // is reachable by pointer or keyboard, and no create affordance — the
+  // pane's button, the sidebar's row, the Projects menu — renders until a
+  // read succeeds.
   registryFails = true;
   await page.reload({ waitUntil: "networkidle" });
-  await page.locator('[data-empty-pane="unread"]').waitFor();
-  assert.equal(await page.locator("[data-empty-title]").textContent(), "Projects unavailable");
+  await page.locator('[data-empty-pane="error"]').waitFor();
+  assert.equal(await page.locator("[data-empty-title]").textContent(), "Can't reach the runtime");
+  assert.ok((await page.locator("[data-empty-body]").textContent()).startsWith("The list on the left is from your last visit."),
+    "the pane says whose rows those are");
   assert.equal(
-    await page.locator("[data-empty-body]").textContent(),
+    await page.locator("[data-empty-detail]").textContent(),
     "project registry unavailable",
-    "the body carries the failure itself",
+    "the failure itself trails the reassurance",
   );
-  assert.equal(await page.locator("[data-empty-action]").count(), 0,
-    "the pane offers no create action while the read fails");
+  assert.equal(await page.locator("[data-empty-action]").textContent(), "Retry now",
+    "the pane offers a retry, never a create action, while the read fails");
+  const staleList = page.locator("[data-project-list][data-list-stale]");
+  await staleList.waitFor();
+  assert.equal(await staleList.getAttribute("aria-busy"), "true", "the cached list says it is busy");
+  assert.equal(await staleList.evaluate((el) => el.inert), true, "and is inert");
+  assert.ok(await page.locator("[data-project-toggle]").count() > 0, "the last visit's project rows are still drawn");
+  assert.ok(await page.locator("[data-list-syncing]").isVisible(), "the header says the rail is syncing");
+  assert.equal(await page.locator("[data-projects-menu]").count(), 0,
+    "no Projects menu over a list nobody confirmed");
   assert.equal(await page.locator("[data-new-project-row]").count(), 0,
     "the sidebar offers no New project row while the read fails");
-  assert.ok(await page.getByText("project registry unavailable").first().isVisible(),
-    "the sidebar surfaces the failure in its error banner");
-  console.log("ok: a failed registry read renders unread, with no create affordances");
+  // Keyboard: every row control is out of the focus order, so the + on a
+  // cached project cannot open a picker over an unconfirmed project.
+  const staleControls = await page.locator("[data-project-list] button").count();
+  assert.ok(staleControls > 0, "the cached rows still carry their controls, inert");
+  const focusedInList = await page.locator("[data-project-list] button").first().evaluate((el) => {
+    el.focus();
+    return el.closest("[data-project-list]").contains(document.activeElement);
+  });
+  assert.equal(focusedInList, false, "a stale row control refuses focus");
+  for (let i = 0; i < staleControls + 2; i++) await page.keyboard.press("Tab");
+  assert.equal(await page.evaluate(() => document.activeElement?.closest("[data-project-list]") !== null && document.activeElement?.closest("[data-project-list]") !== undefined), false,
+    "Tab never lands inside the stale list");
+  await page.keyboard.press("Enter");
+  assert.equal(await page.locator("[data-new-session-modal]").count(), 0,
+    "Enter over the stale rail opens no picker");
+  console.log("ok: a failed read with a cached list draws it stale and inert, with a retry and no create affordances");
+
+  // ---- the failed registry read, nothing cached ----
+  // Without a cache there is nothing to keep: no rows, no bands (bands are
+  // for a read still in flight, not a failed one), and the same error
+  // pane, now reassuring without naming a list.
+  await page.evaluate(() => localStorage.removeItem("noisedeck.session-list"));
+  await page.reload({ waitUntil: "networkidle" });
+  await page.locator('[data-empty-pane="error"]').waitFor();
+  assert.ok((await page.locator("[data-empty-body]").textContent()).startsWith("Your sessions are still on the server."),
+    "the pane reassures without a list to name");
+  assert.equal(await page.locator("[data-project-toggle]").count(), 0, "no rows without a cache");
+  assert.equal(await page.locator("[data-loading-band]").count(), 0, "no bands over a failed read");
+  assert.equal(await page.locator("[data-new-project-row]").count(), 0,
+    "the sidebar offers no New project row while the read fails");
+  assert.equal(await page.locator("[data-projects-menu]").count(), 0,
+    "and no Projects menu over a list nobody has read");
+  console.log("ok: a failed read with nothing cached renders the error state alone");
 
   // ---- the no-project rail (comp desktop-r16) ----
   // With no projects the Projects header and its menu are gone: the

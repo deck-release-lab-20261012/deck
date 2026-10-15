@@ -79,8 +79,8 @@ type TagFile struct {
 }
 
 // taskRoot keeps both the project directory and its os.Root traversal guard
-// alive. The separate anchor descriptor is also the only path handed across
-// the tmux process boundary: a renamed project remains the same directory.
+// alive. The separate anchor descriptor binds the engine's working directory:
+// a renamed project remains the same directory.
 // storePath and preferencesPath are set only on engine-selected roots; the
 // legacy stateRoot/backlogPath defaults serve the low-level access tests.
 type taskRoot struct {

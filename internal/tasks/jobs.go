@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -24,6 +25,8 @@ var ErrInvalidPRD = errors.New("not an eligible PRD file")
 // ErrPRDExists reports an exclusive-create PRD write whose name is taken:
 // an existing PRD is never overwritten by the upload path.
 var ErrPRDExists = errors.New("PRD file already exists")
+
+var ErrGenerationUnsupported = errors.New("PRD task generation is not supported on this platform; add tasks manually or use the Tasks CLI")
 
 // Runner executes Taskmaster generation jobs as attachable managed tmux
 // sessions with per-project serialization.
@@ -92,6 +95,9 @@ func (r *Runner) Generate(ctx context.Context, projectID, prdName string) (*Run,
 	p, err := r.projects.Get(ctx, projectID)
 	if err != nil {
 		return nil, err
+	}
+	if runtime.GOOS != "linux" {
+		return nil, ErrGenerationUnsupported
 	}
 	root, err := openEngineTaskRoot(ctx, r.executable, p.CanonicalPath, r.accessHooks.rootAnchored)
 	if err != nil {

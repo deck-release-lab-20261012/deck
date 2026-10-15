@@ -430,6 +430,12 @@ export class FixtureApiClient implements ApiClient, FileApiClient {
   async saveLayout(next: SidebarLayout): Promise<SidebarLayout> {
     return next;
   }
+  // The preview remembers nothing across loads: it opens on the fixture
+  // session whatever was last looked at.
+  async getLastSession(): Promise<string | null> {
+    return null;
+  }
+  async saveLastSession(): Promise<void> {}
   // The preview stands in for a first-use operator: no stored tutorial
   // record. Writes persist only inside the preview session, so the panel
   // can be exercised without touching anything that outlives it.

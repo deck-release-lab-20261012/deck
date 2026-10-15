@@ -124,6 +124,7 @@ func TestOmpHookAssetCarriesTheCaptureMechanism(t *testing.T) {
 		`hook_event_name: "SessionStart"`,   // the payload shape the receiver POSTs
 		"session_id",                        // the payload's identity field
 		`source: "startup",`,                // capture is startup-only
+		"pid: String(process.pid)",          // the reporting process, so subagents are rejected
 		"const body = JSON.stringify",       // retry attempts reuse one serialized body
 		"await deliver(url, token, body)",   // delivery stays in the hook process
 	} {
@@ -180,7 +181,7 @@ func TestInProcessHookAssetsBoundCaptureDelivery(t *testing.T) {
 // `sha256sum internal/provider/assets/omp-hook.ts` when the hook deliberately
 // changes.
 func TestOmpHookAssetChecksum(t *testing.T) {
-	const want = "60d046c07bb304fad162bd9c56468c4a1627937594494a4dcf638847d77ae837"
+	const want = "e93f61227b6c91bf3ebdf10a166b403e76a3188e0bb22f113ea873762ad56cbb"
 	if got := fmt.Sprintf("%x", sha256.Sum256(OmpHookPlugin)); got != want {
 		t.Fatalf("omp-hook.ts sha256 = %s, want %s (deliberate hook change? update both)", got, want)
 	}

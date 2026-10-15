@@ -205,6 +205,14 @@ export function rowMeta(entry: FileEntry, field: SortField = "name", now?: numbe
   return formatFileSize(entry.size ?? 0);
 }
 
+// rowChange is the words for a row's git marker, or "" when the listing
+// reported none.
+export function rowChange(entry: FileEntry): string {
+  if (entry.change === "modified") return "Modified";
+  if (entry.change === "new") return "New";
+  return "";
+}
+
 // viewerStatusParts is the footer's machine register as facts: kind, line
 // count for decoded text, size, recency (its words split from its number so
 // a narrow presentation can keep just the number), and read-only — stated

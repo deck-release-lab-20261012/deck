@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"time"
 )
 
@@ -21,8 +20,10 @@ func runTaskEngine(parent context.Context, executable string, root *taskRoot, ar
 	ctx, cancel := context.WithTimeout(parent, taskEngineReadTimeout)
 	defer cancel()
 	argv := append([]string{"tasks"}, args...)
-	cmd := exec.CommandContext(ctx, executable, argv...)
-	cmd.Dir = root.descriptorPath()
+	cmd, err := newTaskCommand(ctx, executable, root, argv...)
+	if err != nil {
+		return nil, err
+	}
 	cmd.Env = withoutEnvironment(os.Environ(), "NOISE_PROJECT_DIR")
 	stdout := boundedBuffer{limit: taskEngineListOutputLimit}
 	var stderr boundedBuffer

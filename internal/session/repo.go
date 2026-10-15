@@ -603,7 +603,10 @@ func (r *Repository) ListResumeCandidates(ctx context.Context) ([]*Session, erro
 		     WHERE slot.session_id = sessions.id
 		   )
 		   AND NOT (status = ? AND COALESCE(exit_code, -1) = 0)
-		 ORDER BY created_at`,
+		 -- Newest first: whatever a bounded pass cannot reach must be the
+		 -- oldest rows, never the sessions the operator just lost, and a
+		 -- same-millisecond creation tie falls to the younger rowid.
+		 ORDER BY created_at DESC, rowid DESC`,
 		StatusExited, StatusInterrupted, StatusExited)
 	if err != nil {
 		return nil, fmt.Errorf("session: list resume candidates: %w", err)

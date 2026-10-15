@@ -221,6 +221,12 @@ async function live(browser) {
       }
       return json(200, { csrf: "header-login", pending: pendingLogin && url.searchParams.get("session") === session.id ? [{ id: "header-login", flow: "codex-browser", expires: new Date(Date.now() + 300000).toISOString() }] : [] });
     }
+    // Selecting the second session is the operator choosing it, and that
+    // choice is remembered on the server; every other write is a defect.
+    if (path === "/api/settings/last-session") {
+      if (request.method() === "PUT") return json(200, request.postDataJSON());
+      return json(404, { code: "not_found", message: "no last session remembered" });
+    }
     assert.equal(request.method(), "GET", `header navigation must not mutate ${path}`);
     if (path === "/api/build") return json(200, { build_id: runningBuild });
     if (path === "/api/settings") return json(200, { skip_permissions: false, skip_close_confirm: false, skip_remove_project_confirm: false });

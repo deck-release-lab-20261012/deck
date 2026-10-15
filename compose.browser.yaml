@@ -27,6 +27,9 @@ services:
     build:
       context: .
       target: browser
+      args:
+        NOISE_TASKS_REPO: ${NOISE_TASKS_REPO:-https://github.com/noisefloor-oss/tasks.git}
+        NOISE_SDLC_REPO: ${NOISE_SDLC_REPO:-https://github.com/noisefloor-oss/sdlc.git}
     # The repo-owned entrypoint uses Playwright's public launchServer API and
     # the frozen package copied into the image. It neither depends on a
     # version-specific CLI command nor fetches code at container startup.

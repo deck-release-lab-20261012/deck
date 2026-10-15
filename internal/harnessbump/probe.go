@@ -258,13 +258,21 @@ func (p *ProbeSpec) commands() []ProbeCommand {
 // returns everything it wrote and its exit error.
 type Runner func(ctx context.Context, args []string, stdin string) (output string, err error)
 
+// tmpfsHome is the probe container's /tmp. Moby prepends noexec to every
+// --tmpfs option list and only a later explicit exec cancels it, so
+// "rw,mode=1777" alone mounts a /tmp that refuses to run anything: the
+// claude, kimi and codex receive probes exec their a2a hook wrapper from
+// the probe root there and fail with "Permission denied", which reads as a
+// broken CLI release rather than a mount flag.
+const tmpfsHome = "/tmp:rw,exec,mode=1777"
+
 // DockerRunner runs the harness inside a built image: the image read-only,
 // no network, and a tmpfs home because several CLIs write state from
 // --help.
 func DockerRunner(image, executable string) Runner {
 	return func(ctx context.Context, args []string, stdin string) (string, error) {
 		argv := append([]string{"run", "--rm", "--interactive", "--network", "none", "--read-only",
-			"--tmpfs", "/tmp:rw,mode=1777", "--env", "HOME=/tmp",
+			"--tmpfs", tmpfsHome, "--env", "HOME=/tmp",
 			"--env", "XDG_CONFIG_HOME=/tmp/config", "--env", "XDG_DATA_HOME=/tmp/data",
 			"--env", "XDG_STATE_HOME=/tmp/state", "--env", "XDG_CACHE_HOME=/tmp/cache",
 			"--workdir", "/tmp", image, executable}, args...)
@@ -336,7 +344,7 @@ func Probe(ctx context.Context, spec *ProbeSpec, version string, run Runner) ([]
 func ReceiveDockerRunner(image, network string) Runner {
 	return func(ctx context.Context, args []string, stdin string) (string, error) {
 		argv := []string{"run", "--rm", "--interactive", "--read-only",
-			"--tmpfs", "/tmp:rw,mode=1777", "--env", "HOME=/tmp"}
+			"--tmpfs", tmpfsHome, "--env", "HOME=/tmp"}
 		if network != "outbound" {
 			argv = append(argv, "--network", "none")
 		}

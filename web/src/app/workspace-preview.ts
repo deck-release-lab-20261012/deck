@@ -111,6 +111,11 @@ const api = new FixtureApiClient(
   state.filesConflict,
 );
 if (state.projectPreview !== null) configureProjectPreviewFixture(api, state.projectPreview);
+// The loading states hold the registry read open or fail it: the shell
+// then draws exactly what the live app draws before, or without, an
+// answer (comp Workspace Loading State).
+if (emptyState === "loading") api.listProjects = () => new Promise<never>(() => {});
+if (emptyState === "error") api.listProjects = () => Promise.reject(new Error("project registry unavailable"));
 // The phone frame reserves the mobile comp's device mock — a 12px figure
 // gutter, a 1px bezel, the 54px status strip and the 35px home band — so the
 // app's content lands at the reference's origin. It reserves those bands
@@ -214,13 +219,19 @@ const renderEmptySurfaces = (): void => {
     sessions: emptyState === "no-session",
   });
   const terminal = region(root, "terminal");
-  terminal.innerHTML = emptyPaneHtml({ kind: emptyState, projectName: project?.name ?? null });
+  terminal.innerHTML = emptyPaneHtml({
+    kind: emptyState,
+    projectName: project?.name ?? null,
+    error: sidebarModel.error ?? "",
+    phase: "reconnect",
+  });
   terminal.style.backgroundColor = "var(--color-surface)";
   region(root, "terminal-card").style.backgroundColor = "var(--color-surface)";
   // The pane's one action reaches the same dialogs the sidebar's rows open,
   // exactly as the live shell wires it.
   terminal.querySelector("[data-empty-action]")?.addEventListener("click", () => {
     if (emptyState === "no-project") sidebar.openNewProject("[data-empty-action]");
+    else if (emptyState === "error") void sidebar.refresh();
     else sidebar.openNewSession(target.id);
   });
 };
@@ -683,6 +694,15 @@ root.addEventListener("click", (event) => {
 });
 
 void (async () => {
+  // The unanswered read never settles, so the shell is drawn from the
+  // model's initial state and the page marks itself ready there.
+  if (emptyState === "loading") {
+    void sidebarModel.refresh();
+    sidebar.render();
+    renderEmptySurfaces();
+    markPreviewState();
+    return;
+  }
   await sidebarModel.refresh();
   sidebarModel.setAutoColorProjects(previewAutoColor);
   // The comp's resting selection is the claude row; selecting through the

@@ -112,6 +112,16 @@ type ResumeIdentityAttestationDescriptor interface {
 	ExactResumeHookSource() string
 }
 
+// StartupResumeCaptureDescriptor is implemented by providers whose resume
+// flight reports identity through the same process-launch callback a fresh
+// launch uses — omp's session_start fires on --resume and carries the
+// resumed id with a startup-shaped source. The returned source is matched
+// byte-for-byte; Deck never renames a startup callback a resume.
+type StartupResumeCaptureDescriptor interface {
+	Descriptor
+	ResumeCaptureHookSource() string
+}
+
 // StorePinningDescriptor is implemented by providers whose conversations live
 // in a store the CLI resolves from its environment, so a resume can be made
 // to consult the store the conversation actually wrote instead of whatever

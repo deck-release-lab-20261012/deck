@@ -87,11 +87,16 @@ export default function (pi) {
       const token = process.env.NOISEDECK_SESSION_HOOK_TOKEN;
       if (!url || !token) return;
       const cwd = ctx?.sessionManager?.getCwd?.() ?? "";
+      // pid names the reporting process so the capture endpoint can tell
+      // this pane from a subagent: children inherit this hook's token and
+      // fire their own session_start with a fresh conversation id, and the
+      // parent row must not roll to a child's id.
       const body = JSON.stringify({
         hook_event_name: "SessionStart",
         session_id: sessionId,
         cwd,
         source: "startup",
+        pid: String(process.pid),
       });
       await deliver(url, token, body);
     } catch {

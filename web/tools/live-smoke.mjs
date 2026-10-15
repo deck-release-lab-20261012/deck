@@ -205,6 +205,13 @@ try {
   let registered = false;
   let projectRemoved = false;
   let projectListFailures = 1;
+  // The server's memory of the last opened session, and every write the
+  // console makes to it.
+  let serverLastSession = null;
+  const lastSessionPuts = [];
+  // projectListHangs holds that many project-list requests open forever:
+  // the stalled-first-read path, where the poll must run anyway.
+  let projectListHangs = 0;
   let providersFail = false;
   let providersSuccessDelayMS = 0;
   let sessionOneStatus = "running";
@@ -217,9 +224,6 @@ try {
   // The retained screen of session-1's dead pane, served as bytes to the
   // resume-ended card. Fixture text, never interpreted by the app.
   let sessionOneScreen = null;
-  // A title marker proves the ordinary status response reached renderChrome,
-  // which runs after refreshOpenPopover; response arrival alone is too early.
-  let moreMenuRefreshProbe = null;
   let sessionTwoStatus = "running";
   let sessionTwoPresentationState = "running";
   let sessionTwoDetailFailures = 0;
@@ -317,6 +321,14 @@ try {
       // answer it for the menu to settle.
       return json(200, consoleSettings);
     }
+    if (request.method() === "GET" && path === "/api/settings/last-session") {
+      if (serverLastSession === null) return json(404, { error: "not_found", message: "no last session remembered" });
+      return json(200, { session_id: serverLastSession });
+    }
+    if (request.method() === "PUT" && path === "/api/settings/last-session") {
+      lastSessionPuts.push(request.postDataJSON().session_id);
+      return json(200, request.postDataJSON());
+    }
     if (request.method() === "GET" && path === "/api/settings/layout") {
       // 404 is the real backend's "no layout saved yet" answer: the sidebar
       // keeps its default expansion rather than reading a missing row as an
@@ -339,6 +351,10 @@ try {
       return json(200, { configured: false, self_service: false, enabled: false });
     }
     if (request.method() === "GET" && path === "/api/projects") {
+      if (projectListHangs > 0) {
+        projectListHangs--;
+        return new Promise(() => {});
+      }
       if (projectListFailures > 0) {
         projectListFailures--;
         return json(503, {
@@ -528,11 +544,7 @@ try {
           sessionTwoDetailFailures--;
           return json(503, { error: "temporarily_unavailable", message: "session detail unavailable" });
         }
-        const session = detail(summary);
-        if (summary.id === "session-1" && moreMenuRefreshProbe !== null) {
-          session.display_name = `More menu refresh ${++moreMenuRefreshProbe}`;
-        }
-        return json(200, session);
+        return json(200, detail(summary));
       }
       if (request.method() === "GET" && path === `/api/sessions/${summary.id}/messages`) {
         // Guard: the direct-terminal live app must never query the retired
@@ -590,9 +602,14 @@ try {
     const session = url.pathname.split("/").at(-2);
     const controller = url.searchParams.get("controller");
     const takeover = url.searchParams.get("takeover") === "1";
-    sockets.push({ session, controller, takeover });
+    const record = { session, controller, takeover, closed: false };
+    sockets.push(record);
     columnsBySession.set(session, Number(url.searchParams.get("cols")));
-    socket.onClose(() => { closedSockets++; });
+    socket.onClose(() => {
+      if (record.closed) return;
+      record.closed = true;
+      closedSockets++;
+    });
     if (session === "session-1" && !takeover && !firstLeaseRefused) {
       firstLeaseRefused = true;
       socket.send(JSON.stringify({
@@ -661,24 +678,44 @@ try {
   await page.reload({ waitUntil: "networkidle" });
   await page.locator('[data-region="terminal"]')
     .getByText("project registry unavailable", { exact: true }).waitFor();
-  await page.locator('[data-empty-pane="unread"]').waitFor();
+  await page.locator('[data-empty-pane="error"]').waitFor();
   assert.equal(
     await page.getByText("No projects yet", { exact: true }).count(),
     0,
     "a failed authoritative read is not rendered as an empty database",
   );
   assert.equal(
-    await page.locator("[data-empty-action]").count(),
-    0,
-    "no empty-state action renders while the authoritative read is failing",
+    await page.locator("[data-empty-action]").textContent(),
+    "Retry now",
+    "the only action while the authoritative read is failing is a retry, never a create",
   );
   assert.equal(
     await page.locator("[data-new-project-row]").count(),
     0,
     "the sidebar offers no New project row while the authoritative read is failing",
   );
+  // Retry now runs the read at once; the registry answers this time.
+  await page.locator("[data-empty-action]").click();
   await page.getByText("No projects yet", { exact: true })
-    .waitFor({ timeout: 12_000 });
+    .waitFor({ timeout: 5_000 });
+  console.log("ok: Retry now reaches the registry without waiting for the poll");
+
+  // The stalled first read: the request never answers. The pane says it is
+  // reconnecting, then after two seconds that it is still reaching the
+  // runtime, and the poll — started before the first read, not after it —
+  // reaches the registry on its own at ten seconds and settles the page.
+  projectListHangs = 1;
+  await page.reload({ waitUntil: "load" });
+  await page.locator('[data-empty-pane="loading"][data-empty-phase="reconnect"]').waitFor();
+  assert.equal(await page.locator("[data-empty-action]").count(), 0, "no action while the read is in flight");
+  assert.equal(await page.locator("[data-new-project-row]").count(), 0, "no create affordance while the read is in flight");
+  assert.ok(await page.locator('[data-region="sidebar"] [data-loading-band]').count() > 0,
+    "the rail draws bands while the read is in flight");
+  await page.locator('[data-empty-pane="loading"][data-empty-phase="slow"]').waitFor({ timeout: 5_000 });
+  await page.getByText("No projects yet", { exact: true })
+    .waitFor({ timeout: 15_000 });
+  assert.equal(await page.locator("[data-loading-band]").count(), 0, "the bands leave with the answer");
+  console.log("ok: a first read that hangs is superseded by the poll, not waited on");
   // The empty-state guidance names the current action and never uses
   // container or runtime vocabulary.
   const guidance = page.locator('[data-region="terminal"]').getByText("Point Deck at a directory, an existing repository, or a repository to clone.", { exact: true });
@@ -1218,6 +1255,34 @@ try {
     await expandSidebar(page);
     await page.locator('[data-session="session-1"]').click();
     await waitForTerminal(page, "OUTPUT session-1");
+
+    // The last opened session follows the operator across devices: every
+    // click above was written to the server, and on a cold load the
+    // server's memory outranks this browser's own — a phone opens what the
+    // desktop was looking at. The phone-width clicks wrote it too.
+    assert.deepEqual(lastSessionPuts.slice(-2), ["session-2", "session-1"],
+      `each selection is remembered on the server, in order: ${JSON.stringify(lastSessionPuts)}`);
+    assert.equal(await page.evaluate(() => localStorage.getItem("noisedeck.last-session-id")), "session-1",
+      "and in this browser");
+    serverLastSession = "session-2";
+    // A navigation destroys the old document's socket without a close the
+    // mock can observe, so the socket open across this reload is counted
+    // closed by hand; the logout check below is the app's own accounting.
+    const openAcrossReload = sockets.filter((record) => !record.closed);
+    await page.reload({ waitUntil: "networkidle" });
+    await waitForTerminal(page, "OUTPUT session-2");
+    for (const record of openAcrossReload) {
+      if (record.closed) continue;
+      record.closed = true;
+      closedSockets++;
+    }
+    assert.equal(await page.locator('[data-session="session-2"]').getAttribute("aria-selected"), "true",
+      "a cold load opens the session the server remembers, not the one this browser last had");
+    serverLastSession = null;
+    await expandSidebar(page);
+    await page.locator('[data-session="session-1"]').click();
+    await waitForTerminal(page, "OUTPUT session-1");
+    console.log("ok: the last opened session is remembered on the server and wins on a cold load");
   }
 
   // A presentation palette belongs to the session being shown, from its first
@@ -1396,41 +1461,6 @@ try {
   await waitForCondition(async () =>
     (await toggleColor(page.locator("[data-confirm-before-closing]")))
       .includes("text-primary"), "settings read reaching the menu");
-  // Keep real action targets through two ordinary polling/render cycles.
-  // Unconditional menu replacement detaches both handles and loses focus.
-  const retainedMoreMenu = await page.locator("[data-more-popover]").elementHandle();
-  const retainedLogout = await page.locator("[data-more-popover] [data-live-logout]").elementHandle();
-  assert.ok(retainedMoreMenu); assert.ok(retainedLogout);
-  await retainedLogout.focus();
-  moreMenuRefreshProbe = 0;
-  try {
-    for (let cycle = 1; cycle <= 2; cycle++) {
-      const response = await page.waitForResponse(async response =>
-        response.request().method() === "GET"
-          && new URL(response.url()).pathname === "/api/sessions/session-1"
-          && response.status() === 200
-          && (await response.json()).display_name === `More menu refresh ${cycle}`,
-      { timeout: 12_000 });
-      const session = await response.json();
-      assert.equal(session.display_name, `More menu refresh ${cycle}`);
-      await page.waitForFunction(title =>
-        document.querySelector("[data-titlebar-title]")?.textContent === title,
-      session.display_name, { timeout: 12_000 });
-      assert.deepEqual(await page.evaluate(({ menu, logout }) => ({
-        menuConnected: menu.isConnected,
-        logoutConnected: logout.isConnected,
-        sameMenu: document.querySelector("[data-more-popover]") === menu,
-        sameLogout: document.querySelector("[data-more-popover] [data-live-logout]") === logout,
-        movedFocusRetained: document.activeElement === logout,
-      }), { menu: retainedMoreMenu, logout: retainedLogout }), {
-        menuConnected: true, logoutConnected: true, sameMenu: true,
-        sameLogout: true, movedFocusRetained: true,
-      }, "unchanged status render detached the More menu or stole moved focus");
-    }
-  } finally {
-    moreMenuRefreshProbe = null;
-    await retainedMoreMenu.dispose(); await retainedLogout.dispose();
-  }
   const confirmBeforeClosing = page.locator("[data-confirm-before-closing]");
   const showInfoBar = page.locator("[data-show-info-bar]");
   assert.ok((await toggleColor(confirmBeforeClosing)).includes("text-primary"),

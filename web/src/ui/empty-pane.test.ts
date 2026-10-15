@@ -97,47 +97,70 @@ test("the states carry their own icons", () => {
   assert.ok(project.includes("M20 20a2 2 0 0 0 2-2V8"), "no-project leads with the folder icon");
 });
 
-test("an unread registry is its own state, never a known-empty one", () => {
-  const html = emptyPaneHtml({ kind: "unread", projectName: null, error: "project registry unavailable" });
-  assert.ok(html.includes('data-empty-pane="unread"'), "the pane carries its state hook");
-  assert.ok(html.includes(">Projects unavailable</h2>"), "the title names the failure, not an empty database");
-  assert.ok(!html.includes("No projects yet"), "an unread registry must never borrow the no-project copy");
-  assert.ok(html.includes(">project registry unavailable</p>"), "the body carries the failure itself");
+test("a failed read is its own state, never a known-empty one", () => {
+  const html = emptyPaneHtml({ kind: "error", projectName: null, error: "project registry unavailable" });
+  assert.ok(html.includes('data-empty-pane="error"'), "the pane carries its state hook");
+  assert.ok(html.includes('role="alert"'), "a failure is announced");
+  assert.ok(html.includes(">Can't reach the runtime</h2>"));
+  assert.ok(!html.includes("No projects yet"), "a failed read must never borrow the no-project copy");
+  assert.ok(!html.includes("Add project"), "nor its onboarding action");
   assert.ok(
-    !html.includes("data-empty-action"),
-    "no create action renders until a registry read succeeds",
+    html.includes("Your sessions are still on the server."),
+    "the body reassures before it explains",
   );
-});
-
-test("the unread state still speaks before any failure arrives", () => {
-  const html = emptyPaneHtml({ kind: "unread", projectName: null });
-  assert.ok(html.includes("The project list has not loaded yet."));
-  assert.ok(!html.includes("data-empty-action"), "no create action without a successful read");
-  assert.ok(html.includes("M12 9v4"), "unread leads with the triangle-alert icon");
-});
-
-test("the unread titlebar sheds identity and panels; only the account menu stays", () => {
-  const html = emptyTitlebarHtml("live", {
-    kind: "unread",
-    project: null,
-  });
-  assert.ok(!html.includes("data-terminal-identity"), "no identity over an unread registry");
-  assert.ok(!html.includes("data-live-files"), "Files has nothing to read");
-  assert.ok(!html.includes("data-live-tasks"), "Tasks has nothing to read");
-  assert.ok(!html.includes("data-live-sessions"), "Sessions has nothing to open");
-  assert.ok(html.includes("data-live-more"), "the account menu stays");
-});
-
-test("a read failure replaces the body copy, not the state", () => {
-  const html = emptyPaneHtml({ kind: "no-session", projectName: "p", error: "project registry unavailable" });
-  assert.ok(html.includes(">No session open</h2>"), "the title still names the state");
-  assert.ok(html.includes('class="max-w-[44ch] text-body-sm text-error"'));
-  assert.ok(html.includes("project registry unavailable"));
+  assert.ok(html.includes("Retrying every 10 seconds."), "and says the page keeps trying");
   assert.ok(
-    !html.includes("Pick a session from the side panel"),
-    "the error does not stack a second explanation under the copy",
+    html.includes('data-empty-detail class="max-w-[44ch] text-caption text-error">project registry unavailable</p>'),
+    "the server's own message trails as a caption, never as the page's explanation",
   );
+  assert.ok(html.includes(">Retry now</button>"), "the one action retries the read");
+  assert.ok(html.includes("M12 9v4"), "error leads with the triangle-alert icon");
+  assert.ok(html.includes('class="text-warning"'), "in the warning tone");
 });
+
+test("the error state with a cached rail says whose rows those are", () => {
+  const html = emptyPaneHtml({ kind: "error", projectName: null, cached: true });
+  assert.ok(html.includes("The list on the left is from your last visit."));
+  assert.ok(!html.includes("data-empty-detail"), "no message, no caption");
+});
+
+test("the loading pane is a spinner and a line, not an empty state", () => {
+  const html = emptyPaneHtml({ kind: "loading", projectName: null });
+  assert.ok(html.includes('data-empty-pane="loading"'));
+  assert.ok(html.includes('data-empty-phase="reconnect"'), "the first phase by default");
+  assert.ok(html.includes('role="status"') && html.includes('aria-busy="true"'));
+  assert.ok(html.includes("animate-spinner"), "a spinner leads");
+  assert.ok(html.includes("Reconnecting to your sessions…"));
+  assert.ok(!html.includes("data-empty-title"), "no title: nothing has been found out yet");
+  assert.ok(!html.includes("data-empty-action"), "no action: nothing to act on yet");
+  assert.ok(!html.includes("No projects yet") && !html.includes("No session open"), "never an empty state's copy");
+  assert.ok(!html.includes("font-mono"), "the app's own voice, not the machine's");
+  assert.ok(html.includes("pb-[7%]"), "lifted like the settled states so the swap lands in place");
+});
+
+test("the loading pane names the session it is reattaching to", () => {
+  const html = emptyPaneHtml({ kind: "loading", projectName: null, session: "Fix <PRD> parser" });
+  assert.ok(html.includes("Reattaching to <em>Fix &lt;PRD&gt; parser</em>…"), "the remembered row, escaped");
+});
+
+test("the slow phase says the wait is the runtime's and nothing has been closed", () => {
+  const html = emptyPaneHtml({ kind: "loading", projectName: null, phase: "slow" });
+  assert.ok(html.includes('data-empty-phase="slow"'));
+  assert.ok(html.includes("Still reaching the runtime"));
+  assert.ok(html.includes("Nothing has been closed."));
+  const cached = emptyPaneHtml({ kind: "loading", projectName: null, phase: "slow", cached: true });
+  assert.ok(cached.includes("These are your sessions as of your last visit."));
+});
+
+test("the loading and error titlebars shed identity and panels; only the account menu stays", () => {
+  for (const kind of ["loading", "error"] as const) {
+    const html = emptyTitlebarHtml("live", { kind, project: null });
+    assert.ok(!html.includes("data-terminal-identity"), `${kind}: no identity before a project is readable`);
+    assert.ok(!html.includes("data-live-files") && !html.includes("data-live-tasks"), `${kind}: no panel triggers`);
+    assert.ok(html.includes("data-live-more"), `${kind}: the account menu stays`);
+  }
+});
+
 
 test("the no-session titlebar keeps the session chrome with the project in the identity slot", () => {
   const html = emptyTitlebarHtml("live", {

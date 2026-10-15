@@ -1241,27 +1241,45 @@ export class Sidebar {
     const jobRows = this.cloneJobs
       .filter((j) => j.status !== "done")
       .map((j) => cloneRowHtml(j)).join("");
+    // Until the first read answers, an empty rail is not an empty
+    // registry (comp Workspace Loading State, 1a): flat bands at row height
+    // hold the list's shape so nothing jumps when the rows arrive.
+    const unanswered = noProjects && m.listState === "loading";
     const listRows = noProjects && jobRows === ""
-      ? (m.registryReadOk ? newProjectRowHtml() : "")
+      ? (m.registryReadOk ? newProjectRowHtml() : unanswered ? loadingBandsHtml() : "")
       : filtered.map((g) => this.renderGroup(g.project.id)).join("") + jobRows;
+    // A stale list — the previous visit's cache, or the last served rows
+    // outliving a failed read — draws dimmed and inert (comp 1b): visible so
+    // the operator sees nothing was lost, dead so nothing on it claims to
+    // be current. `inert` is what makes it dead: it takes every row
+    // control out of the focus order and the keyboard's reach, where
+    // pointer-events alone would leave Enter on a focused + able to open a
+    // picker over an unconfirmed project. The header says it is syncing,
+    // and sheds its menu, instead of the pane's error repeating in a
+    // banner; the banner stays for a failure that arrives while a session
+    // owns the pane.
+    const paneCarriesError = m.listState === "error" && m.selectedSessionID === null;
+    const header = unanswered
+      ? projectsHeaderHtml({ dimmed: true })
+      : noProjects ? "" : projectsHeaderHtml({ syncing: m.stale });
     const markup = `
       <div class="chrome chrome-flush pl-(--space-4) pr-(--row-px)">
         ${lockupImg()}
       </div>
       ${sheetChromeHtml(this.search)}
       <div class="flex min-h-0 flex-1 flex-col gap-px overflow-y-auto px-4 pb-4 pt-2">
-        ${noProjects ? "" : projectsHeaderHtml()}
-        ${m.error
+        ${header}
+        ${m.error && !paneCarriesError
           ? `<div class="mx-1 rounded-control-sm bg-error-tint px-3 py-2 text-caption text-error-on-tint">${escapeHtml(m.error)}</div>`
           : ""}
         ${m.identityNotice
           ? `<div data-identity-notice class="mx-1 rounded-control-sm bg-wash-selected px-3 py-2 text-caption text-text-secondary">${escapeHtml(m.identityNotice)}</div>`
           : ""}
-        <ul data-project-list class="flex flex-col gap-px" role="listbox">
+        <ul data-project-list ${m.stale || unanswered ? 'data-list-stale aria-busy="true"' : ""} ${m.stale ? "inert" : ""} class="flex flex-col gap-px ${m.stale ? "pointer-events-none opacity-55" : ""}" role="listbox">
           ${listRows}
         </ul>
       </div>
-      ${sheetActionsHtml(noProjects)}
+      ${sheetActionsHtml(noProjects || m.stale)}
     `;
     if (markup === this.renderedMarkup) {
       // The rail on screen already shows exactly these bytes, so the
@@ -4125,11 +4143,57 @@ export function sheetActionsHtml(noProjects = false): string {
   </div>`;
 }
 
-export function projectsHeaderHtml(): string {
+// Neither the unanswered rail nor a stale one carries the Projects menu:
+// every row it offers acts on the list, and there is no served list to act
+// on. dimmed is the unanswered header, the eyebrow at the bands' weight;
+// syncing is the stale header, the eyebrow trailed by a spinner and the
+// word, over rows that are the last known list rather than the served one.
+export function projectsHeaderHtml(options: { dimmed?: boolean; syncing?: boolean } = {}): string {
+  const eyebrowClass = "px-2 py-[3px] text-micro font-medium uppercase leading-[1.55] tracking-(--type-micro-ls) text-text-tertiary";
+  if (options.dimmed === true) {
+    return `<div class="mb-1 flex min-h-[26px] items-center pr-[3px]">
+    <span data-projects-eyebrow class="${eyebrowClass} opacity-60">Projects</span>
+  </div>`;
+  }
+  if (options.syncing === true) {
+    return `<div class="mb-1 flex min-h-[26px] items-center pr-[3px]">
+    <span data-projects-eyebrow class="${eyebrowClass}">Projects</span>
+    <span data-list-syncing role="status" class="ml-auto inline-flex items-center gap-1.5 text-micro text-text-tertiary"><span aria-hidden="true" class="block h-[10px] w-[10px] flex-none animate-spinner rounded-circle border-[1.5px] border-border-strong border-t-text-secondary"></span>Syncing</span>
+  </div>`;
+  }
   return `<div class="mb-1 flex min-h-[26px] items-center pr-[3px]">
     <button data-projects-menu aria-haspopup="menu" aria-expanded="false" data-hint="${hints.OPEN_PROJECTS_MENU}"
-      class="rounded-control-sm px-2 py-[3px] text-micro font-medium uppercase leading-[1.55] tracking-(--type-micro-ls) text-text-tertiary transition-colors hover:text-text-primary aria-expanded:bg-wash-pressed">Projects</button>
+      class="rounded-control-sm ${eyebrowClass} transition-colors hover:text-text-primary aria-expanded:bg-wash-pressed">Projects</button>
   </div>`;
+}
+
+// The unanswered rail's bands (comp Workspace Loading State, 1a): four
+// project rows fading down the list, each with its session rows, flat and
+// unanimated — Blueprint has no skeleton by design, so these neither
+// shimmer nor pulse. Every band is the real row's height (a 19px line box
+// inside the row's vertical padding) so the served rows land exactly where
+// the bands were.
+export function loadingBandsHtml(): string {
+  const projects: Array<{ opacity: string; width: string; sessions: string[] }> = [
+    { opacity: "1", width: "118px", sessions: ["132px", "96px"] },
+    { opacity: ".7", width: "86px", sessions: ["110px"] },
+    { opacity: ".45", width: "132px", sessions: ["146px", "88px"] },
+    { opacity: ".25", width: "74px", sessions: [] },
+  ];
+  return projects.map((project) => {
+    const sessions = project.sessions.map((width) =>
+      `<li aria-hidden="true" class="flex h-[31px] items-center gap-2 px-2">
+          <span class="h-4 w-4 flex-none rounded-mark bg-border"></span>
+          <span class="h-2 rounded-pill bg-border" style="width:${width}"></span>
+        </li>`).join("");
+    return `<li data-loading-band aria-hidden="true" class="flex flex-col" style="opacity:${project.opacity}">
+        <div class="flex h-[31px] items-center gap-(--row-icon-gap) pl-(--row-px)">
+          <span class="inline-flex w-[13px] flex-none justify-center"><span class="h-[7px] w-[7px] rounded-[2px] bg-border-strong"></span></span>
+          <span class="h-[9px] rounded-pill bg-border-strong" style="width:${project.width}"></span>
+        </div>
+        ${sessions === "" ? "" : `<ul class="mb-1.5 ml-[11px] mt-0.5 flex flex-col gap-px border-l-2 border-border pl-2">${sessions}</ul>`}
+      </li>`;
+  }).join("");
 }
 
 // Sort by name is a ONE-SHOT action, not a mode: it returns the ids in

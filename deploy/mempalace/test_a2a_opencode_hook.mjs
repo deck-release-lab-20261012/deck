@@ -19,9 +19,26 @@ async function fakeA2A(root, inbox) {
       "import json, os, sys, time",
       "args = sys.argv[1:]",
       "with open(os.environ['A2A_TEST_CAPTURE'], 'a', encoding='utf-8') as stream:",
-      "    stream.write(json.dumps({'args': args, 'stdin': sys.stdin.read()}) + '\\n')",
+      // A follower child holds stdin open as its death signal and must not block on it.
+      "    _stdin = '' if '--follow' in args else sys.stdin.read()",
+      "    stream.write(json.dumps({'args': args, 'stdin': _stdin}) + '\\n')",
       "if args[:1] == ['hook'] and os.path.exists(os.environ.get('A2A_TEST_SLOW_HOOK', '/nonexistent')):",
       "    time.sleep(1.0)",
+      "if args[:1] == ['inbox'] and '--follow' in args:",
+      "    import os as _os, time as _t",
+      "    _root = _os.path.dirname(_os.environ['A2A_TEST_INBOX'])",
+      "    open(_os.path.join(_root, 'follow-pid'), 'w').write(str(_os.getpid()))",
+      "    _last = None",
+      "    while True:",
+      "        try: _doc = open(_os.environ['A2A_TEST_INBOX']).read().strip()",
+      "        except OSError: _doc = '[]'",
+      "        if _doc != _last:",
+      "            _last = _doc",
+      "            sys.stdout.write(_doc + '\\n')",
+      "            sys.stdout.flush()",
+      "            with open(_os.path.join(_root, 'follow-lines'), 'a') as _f:",
+      "                _f.write(_doc + '\\n')",
+      "        _t.sleep(0.02)",
       "if args[:1] == ['inbox']:",
       "    print(open(os.environ['A2A_TEST_INBOX']).read())",
       "if args[:1] == ['mark-read']:",
@@ -62,7 +79,37 @@ function stubClient(sender, requests) {
   };
 }
 
-async function load(root, inbox, shared = null) {
+// Awaits an observable with a deadline so follower-driven tests never
+// depend on timer racing.
+async function until(check, label = "condition", ms = 5000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`timed out waiting for ${label}`);
+}
+
+// Follower children write marker files into the root; teardown waits out
+// any restart-backoff child and retries the removal so a late write cannot
+// fail the suite with ENOTEMPTY.
+async function rmRoot(root, follow = false) {
+  if (follow) {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const pidText = (await readFile(path.join(root, "follow-pid"), "utf8").catch(() => "")).trim();
+      let dead = true;
+      if (pidText && !Number.isNaN(Number(pidText))) {
+        try { process.kill(Number(pidText), 0); dead = false; } catch { dead = true; }
+      }
+      if (dead) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+}
+
+async function load(root, inbox, shared = null, { follow = false } = {}) {
   const { helper, capture } = await fakeA2A(root, inbox);
   process.env.A2A_BIN = helper;
   process.env.NOISEDECK_MEMPALACE_PYTHON = process.env.PYTHON ?? "python3";
@@ -71,6 +118,10 @@ async function load(root, inbox, shared = null) {
   process.env.A2A_TEST_ACK_FAILS = path.join(root, "ack-fails");
   process.env.A2A_TEST_SLOW_HOOK = path.join(root, "slow-hook");
   process.env.A2A_OPENCODE_POLL_MS = "3600000";
+  // Interval-mode tests drive delivery through poll; follower tests opt in
+  // and await the follower's own lines instead.
+  if (follow) delete process.env.A2A_OPENCODE_FOLLOW;
+  else process.env.A2A_OPENCODE_FOLLOW = "0";
   process.env.A2A_STATE_DIR = root;
   const module = await import(
     `${pathToFileURL(path.join(here, "hooks", "a2a-opencode-hook.js"))}?test=${Date.now()}-${Math.random()}`
@@ -123,6 +174,46 @@ test("an idle session receives unread mail through the prompt API and only then 
   const order = (await calls()).map((c) => c.args[0]);
   assert.deepEqual(order, ["hook", "inbox", "mark-read"]);
   assert.deepEqual((await calls()).at(-1).args, ["mark-read", "evt_1"]);
+});
+
+test("a stale gap peek never re-submits a box the follower already handed off", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "deck-a2a-oc-"));
+  try {
+    const box = { id: "evt_9", from_agent: "alice", correlation_id: "chat-9", type: "chat.invite", body: "once only", scope: "chat-9|i" };
+    const { emit, poll, calls, requests } = await load(root, [box], null, { follow: true });
+    await emit({ event: { type: "session.created", properties: { info: { id: "ses_1" } } } });
+    await until(() => requests.length > 0, "follower submission");
+    await until(async () => JSON.parse(await readFile(process.env.A2A_TEST_INBOX, "utf8")).length === 0, "mark-read");
+    assert.deepEqual((await calls()).filter((c) => c.args[0] === "mark-read").at(-1).args, ["mark-read", "evt_9"]);
+    // A gap peek's snapshot may predate the acknowledgement and list the box
+    // again; the delivery history must refuse a second hand-off.
+    await writeFile(process.env.A2A_TEST_INBOX, JSON.stringify([box]));
+    assert.equal(await poll(), false, "the stale snapshot submits nothing");
+    assert.equal(requests.length, 1);
+    await emit({ event: { type: "session.deleted", properties: { sessionID: "ses_1" } } });
+  } finally {
+    await rmRoot(root, true);
+  }
+});
+
+test("a session error interrupts following but later idle still delivers", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "deck-a2a-oc-"));
+  try {
+    const { emit, calls, requests } = await load(root, [], null, { follow: true });
+    await emit({ event: { type: "session.created", properties: { info: { id: "ses_1" } } } });
+    await until(async () => (await readFile(path.join(root, "follow-pid"), "utf8").catch(() => "")) !== "", "follower running");
+    const followerPid = Number((await readFile(path.join(root, "follow-pid"))).toString().trim());
+    const alive = () => { try { process.kill(followerPid, 0); return true; } catch { return false; } };
+    await emit({ event: { type: "session.error", properties: { sessionID: "ses_1" } } });
+    await until(async () => !alive(), "the errored session's follower child exited");
+    await writeFile(process.env.A2A_TEST_INBOX, JSON.stringify([{ id: "evt_8", from_agent: "bob", correlation_id: "chat-8", type: "chat.message", body: "after the error", scope: "chat-8|m" }]));
+    await emit({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } });
+    await until(() => requests.length > 0, "delivery after recovery");
+    assert.match(requests[0].body.parts[0].text, /bob \(chat-8\): after the error/);
+    await emit({ event: { type: "session.deleted", properties: { sessionID: "ses_1" } } });
+  } finally {
+    await rmRoot(root, true);
+  }
 });
 
 test("nothing is delivered before the session exists or while a turn runs", async () => {
@@ -259,6 +350,12 @@ test("a rebuilt plugin reconciles the persisted attempts instead of submitting a
   const acks = (await second.calls()).filter((c) => c.args[0] === "mark-read");
   assert.deepEqual(acks.at(-1).args, ["mark-read", "evt_9"], "the persisted attempt is acknowledged");
   assert.deepEqual(JSON.parse(await readFile(path.join(root, "inbox.json"), "utf8")), []);
+  // A gap peek whose snapshot was captured before that acknowledgement
+  // still lists the box, and the journal entry is gone: the reconciled
+  // scope must be refused, not submitted as if it were new mail.
+  await writeFile(path.join(root, "inbox.json"), JSON.stringify(inbox));
+  assert.equal(await second.poll(), false, "a stale snapshot never re-submits a reconciled box");
+  assert.equal(shared.requests.length, 1, "no submission for the reconciled box");
 });
 
 test("a child session never becomes the target, and its lifecycle is ignored", async () => {

@@ -31,6 +31,7 @@ import re
 import secrets
 import socket
 import shutil
+import threading
 import textwrap
 import stat
 import subprocess
@@ -1252,7 +1253,7 @@ def _pane_for(pid: int) -> dict:
     return {}
 
 
-def presence_metadata(harness: str | None = None, native_session: str | None = None, cwd: str | None = None, owner: dict | None = None) -> dict:
+def presence_metadata(harness: str | None = None, native_session: str | None = None, cwd: str | None = None, owner: dict | None = None, inbox_socket: str | None = None) -> dict:
     if owner is not None:
         fields = ("handle", "harness", "host", "pid", "project", "project_id", "project_name", "deck_session", "display_name", "pane")
         return {**{key: owner[key] for key in fields}, "native_session": native_session or ""}
@@ -1268,6 +1269,9 @@ def presence_metadata(harness: str | None = None, native_session: str | None = N
         "project_id": scope["project_id"] if scope else "",
         "project_name": scope["project_name"] if scope else "",
         "native_session": native_session or "",
+        # Claude Code exports its inbox socket to every hook's environment;
+        # without it the courier cannot reach an idle Claude session at all.
+        "inbox_socket": inbox_socket or "",
         "deck_session": os.environ.get("NOISEDECK_SESSION_ID", ""),
         "display_name": session_label(os.environ.get("NOISEDECK_SESSION_ID", "")),
         "pane": _pane_for(pid),
@@ -2996,6 +3000,8 @@ def wake_limits(peers: list[str], known: dict[str, dict]) -> list[str]:
         if info.get("state") != "idle":
             continue
         harness = info.get("harness")
+        if harness == "claude" and info.get("inbox_socket"):
+            continue  # the courier's socket rung wakes an idle session
         if harness in ("claude", "kimi"):
             notes.append(f"note: {peer} is idle on {harness}; it has no wake while idle and reads this at its next turn")
         elif harness == "codex" and not info.get("native_session"):
@@ -3666,6 +3672,14 @@ def cmd_mark_read(args) -> None:
 
 def cmd_inbox(args) -> None:
     courier_ensure()
+    if args.follow:
+        # One JSON line of unread mail per relay wake, forever: the
+        # streaming peek the extension rungs follow. Nothing is marked
+        # read here — the native receipt is the acknowledgement.
+        if not args.json:
+            raise SystemExit("a2a: --follow prints JSON lines; pair it with --json")
+        follow_stream(chat_id=args.chat)
+        return
     events = unread(chat_id=args.chat)
     # What could not be read is reported beside what could, never marked
     # read: it is bounded to my chats since the cursor and within the hold.
@@ -3721,6 +3735,80 @@ def _wait(chat_id: str | None, timeout_s: float) -> list[dict]:
 def cmd_wait(args) -> None:
     courier_ensure()
     _wait(args.chat, args.timeout)
+
+def follow_stream(stop=None, out=None, chat_id: str | None = None) -> None:
+    """A long-lived peek: one JSON line of unread mail per relay wake.
+
+    The extension rungs consume this instead of polling: one process per
+    session blocks on the relay's wait (any room, since a key or presence
+    arriving is what turns an unverifiable event into mail), and every
+    wake prints exactly what `inbox --peek --json` would — the same
+    `opened()` view, nothing marked read, because the native receipt is
+    what acknowledges.
+    """
+    out = out or sys.stdout
+    stop = stop or (lambda: False)
+    # Slices are short because the relay's wait is a polling loop whose
+    # polls can queue behind another client's reads: a fresh wait's first
+    # poll is immediate, so re-arming every few seconds bounds detection
+    # even where a long slice would stall behind traffic.
+    slice_s = max(1.0, float(os.environ.get("A2A_FOLLOW_SLICE_S") or 5))
+    backoff_s = max(0.0, float(os.environ.get("A2A_FOLLOW_BACKOFF_S") or 1))
+    max_wakes = int(os.environ.get("A2A_FOLLOW_MAX_WAKES") or 0)
+    wakes = 0
+    # Parent-death binding, armed only when the spawner asks for it: the
+    # harness holds this stdin pipe open and never writes, so EOF means it
+    # is gone and this process must not linger. A terminal or a test runner
+    # owns stdin differently and never sets the marker.
+    if os.environ.get("A2A_FOLLOW_PARENT_STDIN") == "1":
+        def _die_with_parent() -> None:
+            try:
+                sys.stdin.buffer.read()
+            except Exception:
+                pass
+            os._exit(0)
+        threading.Thread(target=_die_with_parent, daemon=True).start()
+    scan = read_state(inbox_cursor_name()).get("cursor")
+
+    def emit() -> None:
+        snapshot_events()
+        try:
+            events = unread(chat_id=chat_id)
+        finally:
+            release_events()
+        out.write(json.dumps([opened(e) for e in events]) + "\n")
+        out.flush()
+
+    emit()  # what arrived while nothing was following is still mail
+    wakes += 1
+    if max_wakes and wakes >= max_wakes:
+        return
+    while not stop():
+        try:
+            filters = {"since_event_id": scan} if scan else {}
+            arrived = wait_events(int(slice_s * 1000), **filters)
+        except LogstreamError as exc:
+            if _cursor_refused(exc):
+                # A reset palace refuses the cursor: rescan from the whole
+                # stream, which the next wake folds into fresh unread.
+                scan = None
+                continue
+            # Downtime is not a reset: pause, keep the state, try again.
+            if stop():
+                return
+            time.sleep(backoff_s)
+            continue
+        if arrived:
+            scan = arrived[-1]["id"]
+            if any(e.get("room") in (ROOM_PRESENCE, ROOM_KEYS) for e in arrived):
+                # A dependency arrived: what is placed and which keys are
+                # known is read again, not taken from a cache.
+                _HOSTS_CACHE.update(at=0.0)
+                _PUBLIC_KEYS_CACHE.update(at=0.0)
+        emit()
+        wakes += 1
+        if max_wakes and wakes >= max_wakes:
+            return
 
 
 def cmd_read(args) -> None:
@@ -3807,9 +3895,12 @@ def _cmd_hook(args) -> None:
     native = payload.get("session_id") or payload.get("thread_id") or ""
     cwd = payload.get("cwd") or os.getcwd()
     owner = cached_codex_hook_owner(payload) if args.harness == "codex" else None
+    # Claude Code exports its inbox socket to every hook's environment; every
+    # lifecycle event re-announces it so a newer announcement never drops it.
+    inbox = os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET", "") if args.harness == "claude" else ""
     try:
         state = {"session-start": "online", "prompt": "busy", "stop": "idle", "session-end": "offline"}[args.event]
-        announce(state, harness=args.harness, native_session=native, cwd=cwd, owner=owner)
+        announce(state, harness=args.harness, native_session=native, cwd=cwd, owner=owner, inbox_socket=inbox)
         if args.event == "session-start":
             courier_ensure()
     except LogstreamError as exc:
@@ -4060,6 +4151,29 @@ def _codex_queue(native_session: str, text: str) -> str:
         return "uncertain"
 
 
+def _claude_socket(path: str, text: str) -> str:
+    """Post the wake line to a Claude session's inbox socket. A missing or
+    refused socket accepted nothing; a failed write may have."""
+    path = path.removeprefix("uds:")
+    if not path.startswith("/"):
+        return "inbox-only"
+    line = json.dumps({"type": "user", "message": {"role": "user", "content": text}}).encode() + b"\n"
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        conn.settimeout(10)
+        conn.connect(path)
+    except OSError:
+        conn.close()
+        return "inbox-only"  # the socket is gone; the inbox keeps the event
+    try:
+        conn.sendall(line)
+        return "claude-socket"
+    except OSError:
+        return "uncertain"
+    finally:
+        conn.close()
+
+
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\x80-\x9f]")
 
 
@@ -4121,6 +4235,8 @@ def delivery_mode(target: dict) -> str:
         return "unavailable"
     if harness == "codex" and target.get("native_session"):
         return "codex-queue"
+    if harness == "claude" and target.get("inbox_socket"):
+        return "claude-socket"
     return "inbox-only"
 
 
@@ -4133,6 +4249,8 @@ def deliver(e: dict, target: dict) -> str:
     mode = delivery_mode(target)
     if mode == "codex-queue":
         return _codex_queue(target["native_session"], wake_line(e))
+    if mode == "claude-socket":
+        return _claude_socket(target["inbox_socket"], wake_line(e))
     return mode
 
 
@@ -4656,6 +4774,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--chat", metavar="ID", help="restrict to this chat ID")
     q.add_argument("--json", action="store_true", help="print verified events as JSON; still acknowledges unless --peek")
     q.add_argument("--peek", action="store_true", help="show messages without marking them read")
+    q.add_argument("--follow", action="store_true", help="stream one JSON line of unread mail per relay wake, forever; implies --peek semantics and needs --json")
     q = command("mark-read", "Acknowledge event IDs", "Mark the named message events read.", "a2a mark-read EVENT_ID", cmd_mark_read)
     q.add_argument("event_id", nargs="+", metavar="EVENT_ID", help="one or more exact event IDs")
     q = command("wait", "Wait for messages", "Wait for incoming messages, display them and acknowledge them. Ctrl+C stops waiting.", "a2a wait --timeout 60\na2a wait --chat CHAT_ID", cmd_wait)

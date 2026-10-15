@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package project
 
@@ -8,84 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"runtime"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
-
-func openProjectRoot(projectRoot string, afterAnchor func()) (*os.Root, error) {
-	if !filepath.IsAbs(projectRoot) || filepath.Clean(projectRoot) != projectRoot {
-		return nil, fmt.Errorf("%w: project root is not canonical", ErrOutsideProject)
-	}
-
-	// Acquire each component relative to its already-open parent. A component
-	// replaced by a symlink is refused instead of redirecting the walk.
-	fd, err := openDirectory("/")
-	if err != nil {
-		return nil, fmt.Errorf("open project root anchor: %w", err)
-	}
-	for _, component := range strings.Split(strings.TrimPrefix(projectRoot, "/"), "/") {
-		if component == "" {
-			continue
-		}
-		next, openErr := openDirectoryAt(fd, component)
-		closeErr := unix.Close(fd)
-		if openErr != nil {
-			return nil, fmt.Errorf("%w: project root changed during acquisition: %v", ErrOutsideProject, openErr)
-		}
-		if closeErr != nil {
-			unix.Close(next)
-			return nil, fmt.Errorf("close project root component: %w", closeErr)
-		}
-		fd = next
-	}
-
-	anchor := os.NewFile(uintptr(fd), "project-root")
-	if anchor == nil {
-		unix.Close(fd)
-		return nil, errors.New("open project root anchor: invalid file descriptor")
-	}
-	defer anchor.Close()
-	anchorInfo, err := anchor.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("stat project root anchor: %w", err)
-	}
-	if afterAnchor != nil {
-		afterAnchor()
-	}
-
-	// OpenRoot follows its argument, so bind it through the kernel-owned link
-	// to the acquired descriptor rather than reopening projectRoot by name.
-	root, err := os.OpenRoot("/proc/self/fd/" + strconv.Itoa(fd))
-	if err != nil {
-		return nil, fmt.Errorf("bind project root anchor: %w", err)
-	}
-	probe, err := root.Open(".")
-	if err != nil {
-		root.Close()
-		return nil, fmt.Errorf("validate project root anchor: %w", err)
-	}
-	probeInfo, statErr := probe.Stat()
-	closeErr := probe.Close()
-	if statErr != nil {
-		root.Close()
-		return nil, fmt.Errorf("validate project root anchor: %w", statErr)
-	}
-	if closeErr != nil {
-		root.Close()
-		return nil, fmt.Errorf("close project root probe: %w", closeErr)
-	}
-	if !os.SameFile(anchorInfo, probeInfo) {
-		root.Close()
-		return nil, errors.New("validate project root anchor: descriptor identity changed")
-	}
-	return root, nil
-}
 
 func openDirectory(name string) (int, error) {
 	for {
@@ -330,15 +258,6 @@ func commitUploadIfAbsent(parent *os.File, staged, leaf string) error {
 			}
 		}
 		return err
-	}
-}
-
-func renameNoReplace(pfd int, staged, leaf string) error {
-	for {
-		err := unix.Renameat2(pfd, staged, pfd, leaf, unix.RENAME_NOREPLACE)
-		if !errors.Is(err, syscall.EINTR) {
-			return err
-		}
 	}
 }
 

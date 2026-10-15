@@ -69,6 +69,10 @@ loopback aliases configured by the operator before use.
 
 For a from-source binary build without Docker, see
 [Building from source](#building-from-source-without-docker).
+For an explicitly native Apple Silicon installation, use the
+[native macOS installation procedure](skills/install-deck/references/native-macos.md).
+It has separate prerequisites, provider/Tasks provisioning and process-lifecycle
+checks; Docker-on-macOS evidence is not native qualification.
 
 ## Quick start with Docker Compose
 
@@ -305,6 +309,11 @@ Dev servers remain part of the unconfined workspace — previews do not
 sandbox them.
 
 ## Project tasks
+
+Native macOS supports task initialization, manual tasks, board reads and PRD
+uploads through the configured Tasks CLI. Deck-managed PRD task generation is
+Linux-only; on macOS, add tasks manually or invoke the Tasks CLI explicitly in
+a session. The first-project tutorial does not require PRD generation.
 
 Task boards are driven by the bundled Tasks engine, not by Deck itself.
 The image pins Tasks v2.7.0 at commit

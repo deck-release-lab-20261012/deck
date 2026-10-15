@@ -101,6 +101,10 @@ try {
     if (path.endsWith("/files")) return json(200, { path: "", at_root: true, entries: [] });
     if (path.includes("/taskmaster")) return json(404, { code: "not_taskmaster_project", message: "Not a Tasks project" });
     if (path.endsWith("/chats")) return json(200, { agent: "probe", chats: [] });
+    if (path === "/api/settings/last-session") {
+      if (route.request().method() === "PUT") return json(200, route.request().postDataJSON());
+      return json(404, { code: "not_found", message: "no last session remembered" });
+    }
     throw new Error(`unhandled ${path}`);
   });
   const panel = page.locator('[data-region="tutorial"]');

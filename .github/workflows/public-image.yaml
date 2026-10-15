@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+env:
+  NOISE_TASKS_REPO: ${{ vars.NOISE_TASKS_REPO }}
+  NOISE_SDLC_REPO: ${{ vars.NOISE_SDLC_REPO }}
+
 concurrency:
   group: public-image-${{ github.ref }}
   cancel-in-progress: true

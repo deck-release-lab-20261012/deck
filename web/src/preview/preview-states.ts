@@ -34,7 +34,7 @@ export type RenameParam = "project" | "session";
 export type PanelParam = "files" | "tasks" | "none";
 export type ViewerParam = "text" | "binary" | "empty" | "code";
 export type RecoveryParam = "restarting" | "replayed" | "failed";
-export type EmptyParam = "no-session" | "no-project";
+export type EmptyParam = "no-session" | "no-project" | "loading" | "error";
 // The phone frame the mobile comp draws around every screen. It is capture
 // scaffolding, not product: it reserves the device mock's bezel, status bar
 // and home band so the app's content lands at the same origin as the
@@ -64,7 +64,7 @@ const PANELS: readonly PanelParam[] = ["files", "tasks", "none"];
 const VIEWERS: readonly ViewerParam[] = ["text", "binary", "empty", "code"];
 const RECOVERIES: readonly RecoveryParam[] = ["restarting", "replayed", "failed"];
 
-const EMPTIES: readonly EmptyParam[] = ["no-session", "no-project"];
+const EMPTIES: readonly EmptyParam[] = ["no-session", "no-project", "loading", "error"];
 const FRAMES: readonly FrameParam[] = ["phone"];
 const SIDEBARS: readonly SidebarParam[] = ["open"];
 
@@ -303,6 +303,8 @@ export const PREVIEW_STATES: readonly PreviewState[] = [
   { name: "recovery-failed", params: { recovery: "failed" }, ready: '[data-region="terminal"][data-recovery-state="failed"]' },
   { name: "empty-no-session", params: { empty: "no-session" }, ready: '[data-empty-pane="no-session"]' },
   { name: "empty-no-project", params: { empty: "no-project" }, ready: '[data-empty-pane="no-project"]' },
+  { name: "empty-loading", params: { empty: "loading" }, ready: '[data-empty-pane="loading"]' },
+  { name: "empty-error", params: { empty: "error" }, ready: '[data-empty-pane="error"]' },
 
   { name: "sidebar-open", params: { sidebar: "open" }, ready: '[data-workspace][data-collapsed="false"]' },
 ];

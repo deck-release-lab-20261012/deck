@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 )
@@ -99,8 +98,10 @@ func (h *Handler) addTask(parent context.Context, projectID string, raw AddTaskI
 	}
 	ctx, cancel := context.WithTimeout(parent, addTaskTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, h.executable, addTaskEngineArgv(input)...)
-	cmd.Dir = root.descriptorPath()
+	cmd, err := newTaskCommand(ctx, h.executable, root, addTaskEngineArgv(input)...)
+	if err != nil {
+		return nil, err
+	}
 	cmd.Env = withoutEnvironment(os.Environ(), "NOISE_PROJECT_DIR")
 	var stdout, stderr boundedBuffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr

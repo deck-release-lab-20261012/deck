@@ -50,20 +50,19 @@ func darwinStartTime(p *unix.KinfoProc) int64 {
 
 func darwinProcessPath(pid int) (string, error) {
 	buf := make([]byte, darwinProcPIDPathMaxLen)
-	n, _, errno := syscall.Syscall6(syscall.SYS_PROC_INFO,
+	_, _, errno := syscall.Syscall6(syscall.SYS_PROC_INFO,
 		darwinProcInfoCallPID, uintptr(pid), darwinProcPIDPathInfo, 0,
 		uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
 	if errno != 0 {
 		return "", errno
 	}
-	if n == 0 {
-		return "", errors.New("empty process path")
+	// PROC_PIDPATHINFO reports success independently of the path length;
+	// libproc's proc_pidpath derives that length from the terminated buffer.
+	end := bytes.IndexByte(buf, 0)
+	if end <= 0 {
+		return "", errors.New("empty or unterminated process path")
 	}
-	if end := bytes.IndexByte(buf[:n], 0); end >= 0 {
-		buf = buf[:end]
-	} else {
-		buf = buf[:n]
-	}
+	buf = buf[:end]
 	path := string(buf)
 	resolved, err := filepath.EvalSymlinks(path)
 	if err == nil {

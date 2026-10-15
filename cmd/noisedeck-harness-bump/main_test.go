@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net"
 	"net/http"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/noisefloor-oss/deck/internal/harnessbump"
 )
 
 func TestListNamesEveryHarness(t *testing.T) {
@@ -58,6 +61,66 @@ func TestUsageErrors(t *testing.T) {
 	}
 	if err := run([]string{"jail-dial"}, &out, &out); err == nil || !strings.Contains(err.Error(), "-socket") {
 		t.Errorf("jail-dial without a socket: %v", err)
+	}
+	if err := run([]string{"drop"}, &out, &out); err == nil || !strings.Contains(err.Error(), "-harness") {
+		t.Errorf("drop without its flags: %v", err)
+	}
+}
+
+func TestDropRewritesThePinAndTheReport(t *testing.T) {
+	saved := harnessbump.Catalogue
+	omp, err := harnessbump.Lookup("omp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	harnessbump.Catalogue = []harnessbump.Harness{omp}
+	t.Cleanup(func() { harnessbump.Catalogue = saved })
+	root := t.TempDir()
+	write := func(rel, body string) {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("Dockerfile", "FROM scratch\nARG OMP_VERSION=19.0.0\n")
+	write("deploy/omp_cli_package_test.go", "package deploy\n// \"ARG OMP_VERSION=19.0.0\"\n")
+	write("docs/provider-contracts/README.md", "| omp | 19.0.0 |\n")
+	batchFile := filepath.Join(root, "batch.json")
+	write("batch.json", `{"id":"`+strings.Repeat("c", 64)+`","statuses":[],"updated":["omp"],"revert":{"omp":{"version":"18.1.2"}}}`+"\n")
+	var out bytes.Buffer
+	if err := run([]string{"drop", "-harness", "omp", "-reason", "contract probe failed", "-batch", batchFile, "-root", root}, &out, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "dropped omp") || !strings.Contains(out.String(), "ships 0 update(s)") {
+		t.Fatalf("drop report: %s", out.String())
+	}
+	dockerfile, err := os.ReadFile(filepath.Join(root, "Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(dockerfile), "ARG OMP_VERSION=18.1.2") {
+		t.Fatalf("pin not reverted: %s", dockerfile)
+	}
+	raw, err := os.ReadFile(batchFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result harnessbump.BatchResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Updated) != 0 || len(result.Dropped) != 1 || result.Dropped[0].Harness != "omp" {
+		t.Fatalf("report after drop: %+v", result)
+	}
+	wantID, err := harnessbump.BatchID(harnessbump.ReadPins(dockerfile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ID != wantID {
+		t.Fatalf("report id %s, recomputed %s", result.ID, wantID)
 	}
 }
 

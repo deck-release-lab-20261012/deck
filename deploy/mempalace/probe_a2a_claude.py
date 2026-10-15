@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
-"""Isolated probe: does Claude Code's a2a Stop-hook receive path still work?
+"""Isolated probe: do Claude Code's a2a receive paths still work?
 
-Runs the real `claude` CLI (print mode) against a loopback Anthropic Messages
-server and a synthetic a2a mailbox. The Stop hook blocks the first stop with a
-wake reason; the probe proves the reason reached the model automatically when a
-later model request body contains the wake text `[a2a#synthetic]`.
+Runs the real `claude` CLI against a loopback Anthropic Messages server and a
+synthetic a2a mailbox. Two print-mode phases cover the hook paths: the Stop
+hook blocks the first stop with a wake reason; the probe proves the reason
+reached the model automatically when a later model request body contains the
+wake text `[a2a#synthetic]`. A third phase drives the real TUI in a private
+tmux socket and posts to the session's cross-session inbox socket the way the
+courier's claude-socket rung does, proving an idle session starts a turn with
+no terminal input.
 """
 
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import json
 import os
+import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -310,6 +318,150 @@ def probe_ups_stdout() -> None:
         probe.cleanup()
 
 
+# ── Native receive: the courier's claude-socket rung wakes an idle TUI ──────
+
+SOCKET_TEXT = f"[a2a#synthetic] fixture says (chat-fixture): {INVITE_BODY} over the inbox socket"
+
+
+def load_real_client():
+    """The a2a client under test: A2A_PROBE_CLIENT when set, then the
+    worktree copy beside this probe, then the image's installed
+    /usr/local/bin/a2a. The installed client has no .py extension, so the
+    loader is named explicitly: a bare spec_from_file_location returns None
+    for it and the import dies before the socket check."""
+    here = Path(__file__).resolve()
+    candidates = [here.parents[1] / "a2a" / "a2a.py", Path("/usr/local/bin/a2a")]
+    override = os.environ.get("A2A_PROBE_CLIENT")
+    if override:
+        candidates.insert(0, Path(override))
+    for candidate in candidates:
+        if candidate.exists():
+            loader = importlib.machinery.SourceFileLoader("a2a_cli", str(candidate))
+            spec = importlib.util.spec_from_file_location("a2a_cli", candidate, loader=loader)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+    raise SystemExit("FAIL [claude-socket]: no a2a client found at " + ", ".join(str(c) for c in candidates))
+
+
+def probe_socket(keep: bool = False) -> None:
+    """Drive the real TUI in a private tmux socket: announce the inbox socket
+    at SessionStart, go idle after a bootstrap turn, then deliver through the
+    real rung with zero further terminal input."""
+    probe = Probe("claude-socket", keep=keep)
+    server = make_model_server(probe)
+    # A Unix socket path is bounded (sun_path is 108 bytes): under a deep
+    # TMPDIR the probe root is already too long, so the tmux socket lives at
+    # a short fixed location while everything else stays under the root.
+    tsock = Path("/tmp") / f"a2a-claude-probe-{os.getpid()}.sock"
+
+    def tmux(*args: str, capture: Path | None = None) -> subprocess.CompletedProcess:
+        out = capture.open("w") if capture else subprocess.DEVNULL
+        return subprocess.run(["tmux", "-f", "/dev/null", "-S", str(tsock), *args],
+                              stdout=out, stderr=subprocess.DEVNULL, timeout=30, check=False)
+
+    def pane_tail() -> str:
+        capture = probe.root / "pane.txt"
+        tmux("capture-pane", "-p", capture=capture)
+        return "\n  " + capture.read_text(errors="replace")[-1200:]
+
+    try:
+        write_claude_home(probe)
+        home = probe.root / "home"
+        # With CLAUDE_CONFIG_DIR set, Claude keeps its state file inside it:
+        # the trust record must be seeded there, not at $HOME/.claude.json.
+        (home / ".claude" / ".claude.json").write_text((home / ".claude.json").read_text())
+        settings_path = home / ".claude" / "settings.json"
+        settings = json.loads(settings_path.read_text())
+        settings["crossSessionInbound"] = "accept"
+        settings_path.write_text(json.dumps(settings, indent=2))
+        # The hook wrapper records the socket the session exports, the same
+        # announcement the real hook makes into presence.
+        wrapper = probe.root / "a2a-hook.sh"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            'if [ "${1:-}" = "session-start" ]; then\n'
+            f'  printf \'%s\' "${{CLAUDE_CODE_MESSAGING_SOCKET:-}}" > "{probe.root}/socket-path"\n'
+            "fi\n"
+            f'exec /usr/bin/python3 "{probe.root}/mail.py" hook "$1" --harness claude\n'
+        )
+        wrapper.chmod(0o755)
+
+        port = server.server_address[1]
+        pane_env = {
+            "HOME": str(home),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "TERM": "xterm-256color",
+            "TMPDIR": str(probe.root),
+            "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
+            # ANTHROPIC_API_KEY triggers a key-approval modal in the TUI; the
+            # token form does not, and the loopback model ignores both.
+            "ANTHROPIC_AUTH_TOKEN": "dummy",
+            "ANTHROPIC_MODEL": "claude-sonnet-4-5",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "DISABLE_TELEMETRY": "1",
+            "DISABLE_AUTOUPDATER": "1",
+            "CLAUDE_CONFIG_DIR": str(home / ".claude"),
+        }
+        argv = ["new-session", "-d", "-x", "200", "-y", "50"]
+        for key, value in pane_env.items():
+            argv += ["-e", f"{key}={value}"]
+        argv += ["-c", str(probe.root / "cwd"), "claude", "--dangerously-skip-permissions"]
+        tmux(*argv)
+
+        sock_file = probe.root / "socket-path"
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline and not sock_file.exists():
+            time.sleep(0.5)
+        if not sock_file.exists() or not sock_file.read_text().strip():
+            probe.fail("criterion (a): SessionStart hook never announced an inbox socket" + pane_tail())
+        inbox = sock_file.read_text().strip()
+
+        # The bootstrap turn stands in for the operator opening the session;
+        # everything after it must happen with no terminal input at all.
+        time.sleep(3)
+        tmux("send-keys", "say ok")
+        time.sleep(0.5)
+        tmux("send-keys", "Enter")
+        logdir = probe.root / "modellog"
+        deadline = time.monotonic() + 150
+        while time.monotonic() < deadline:
+            files = list(logdir.glob("*.json"))
+            if files:
+                time.sleep(6)
+                if len(list(logdir.glob("*.json"))) == len(files):
+                    break
+            time.sleep(0.5)
+        bootstrap = len(list(logdir.glob("*.json")))
+        if bootstrap == 0:
+            probe.fail("setup: the bootstrap turn never reached the model" + pane_tail())
+
+        a2a = load_real_client()
+        outcome = a2a._claude_socket(inbox, SOCKET_TEXT)
+        if outcome != "claude-socket":
+            probe.fail(f"criterion (b): the real rung answered {outcome!r} against a live socket")
+
+        deadline = time.monotonic() + 90
+        delivered = False
+        while time.monotonic() < deadline and not delivered:
+            later = sorted(logdir.glob("*.json"))[bootstrap:]
+            delivered = any(SOCKET_TEXT.encode() in p.read_bytes() for p in later)
+            time.sleep(0.5)
+        if not delivered:
+            probe.fail("criterion (c): the posted message never reached the model — "
+                       "the idle session never woke" + pane_tail())
+        print(f"PASS [claude-socket]: SessionStart announced {inbox}, the real rung posted, "
+              "and the idle TUI started a turn with no terminal input")
+    finally:
+        tmux("kill-server")
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+        probe.cleanup()
+
+
 if __name__ == "__main__":
     probe_claude()
     probe_ups_stdout()
+    probe_socket()

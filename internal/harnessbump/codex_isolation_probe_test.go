@@ -20,7 +20,7 @@ func TestCodexIsolationFlagRequiredInBothHelpCommands(t *testing.T) {
 					if strings.Join(args, " ") == missing {
 						flag = replacement
 					}
-					return "Usage: codex resume [OPTIONS] [SESSION_ID]\n  --dangerously-bypass-approvals-and-sandbox\n  " + flag + "\n", nil
+					return "Usage: codex resume [OPTIONS] [SESSION_ID]\n  --dangerously-bypass-approvals-and-sandbox\n  --no-alt-screen\n  " + flag + "\n", nil
 				})
 				if err == nil {
 					t.Fatal("missing exact no-daemon flag passed")

@@ -1,9 +1,13 @@
-// The session pane's empty states (comp desktop-r16). `no-session` is a
-// project in context with nothing open; `no-project` is a console whose
-// registry read succeeded and found nothing; `unread` is a registry no
-// successful read has settled yet — a failed read is not an empty
-// database, so it never borrows the no-project copy or its actions.
-// The states share one anatomy — icon, small-caps title, one
+// The session pane's empty states (comp desktop-r16) and its loading
+// states (comp Workspace Loading State). `no-session` is a project in
+// context with nothing open; `no-project` is a console whose registry read
+// succeeded and found nothing. Both render only after the server has
+// answered: until then the pane is `loading` — a spinner and a line saying
+// what is happening, never an empty state — and after a failed read it is
+// `error`, which says the sessions are still on the server and keeps
+// retrying. A failed read is not an empty database, so it never borrows
+// the no-project copy or its actions.
+// The settled states share one anatomy — icon, small-caps title, one
 // short body line, one primary action — so they read as one family, and
 // all sit on the page surface rather than the terminal ground: this is
 // the app speaking, not output from a session that is not running, so
@@ -14,7 +18,12 @@ import { panelTriggerHtml, type PanelTriggerSurface } from "./panel-trigger.ts";
 import { projectIdentityHtml } from "./terminal-identity.ts";
 import * as hints from "../lib/hints.ts";
 
-export type EmptyPane = "off" | "no-session" | "no-project" | "unread";
+export type EmptyPane = "off" | "no-session" | "no-project" | "loading" | "error";
+
+// The loading pane's two phases (comp Workspace Loading State): the first
+// two seconds say only that the page is reconnecting; past that it says the
+// wait is the runtime's, and that nothing has been closed.
+export type LoadingPhase = "reconnect" | "slow";
 
 // The empty titlebar's right side: the two docked-panel triggers and the
 // account menu, in the exact classes the session chrome uses, so an empty
@@ -84,51 +93,91 @@ export function emptyTitlebarHtml(
 export function emptyPaneHtml(state: {
   kind: Exclude<EmptyPane, "off">;
   projectName: string | null;
+  // error is the server's own message: the `error` state shows it under
+  // its reassurance, so the failure is on the page without becoming the
+  // page's explanation.
   error?: string;
+  phase?: LoadingPhase;
+  // session names the row a cold load is reattaching to, from the
+  // remembered selection and the cached list; null reconnects the list.
+  session?: string | null;
+  // cached says the rail beside the pane is the previous visit's list, so
+  // the slow phase can say whose sessions those are.
+  cached?: boolean;
 }): string {
+  if (state.kind === "loading") return loadingPaneHtml(state.phase ?? "reconnect", state.session ?? null, state.cached === true);
   const title = state.kind === "no-session"
     ? "No session open"
-    : state.kind === "unread" ? "Projects unavailable" : "No projects yet";
+    : state.kind === "error" ? "Can't reach the runtime" : "No projects yet";
   const icon: IconName = state.kind === "no-session"
     ? "layers"
-    : state.kind === "unread" ? "triangle-alert" : "folder";
-  const action = state.kind === "no-session" ? "New session" : "Add project";
+    : state.kind === "error" ? "triangle-alert" : "folder";
+  const iconTone = state.kind === "error" ? "text-warning" : "text-text-tertiary";
+  const action = state.kind === "no-session" ? "New session" : state.kind === "error" ? "Retry now" : "Add project";
   const actionHint = state.kind === "no-session" && state.projectName !== null
     ? hints.projectNewSession(state.projectName)
-    : hints.ADD_WORKSPACE_DIRECTORY_AS_PROJECT;
+    : state.kind === "error" ? hints.RETRY_REACHING_THE_RUNTIME : hints.ADD_WORKSPACE_DIRECTORY_AS_PROJECT;
   const error = state.error ?? "";
-  const failed = error !== "";
   // The body names the project in context so the sentence and the button
-  // always agree about what gets created; a failed refresh that kept the
-  // last-known groups replaces the copy with the error rather than
-  // stacking a second explanation under it.
+  // always agree about what gets created; a failed action that left a
+  // message on a settled state replaces the copy with it rather than
+  // stacking a second explanation under it. The error state's body is the
+  // reassurance, and the server's message trails it as a caption, so the
+  // operator reads "still there" before "what went wrong".
+  const failed = state.kind !== "error" && error !== "";
   const body = failed
     ? escapeHtml(error)
     : state.kind === "no-session"
       ? `Pick a session from the side panel, or start a new one in <em>${escapeHtml(state.projectName ?? "")}</em>.`
-      : state.kind === "unread"
-        ? "The project list has not loaded yet."
+      : state.kind === "error"
+        ? (state.cached === true
+          ? "The list on the left is from your last visit. Your sessions are still on the server. Retrying every 10 seconds."
+          : "Your sessions are still on the server. This page just can't see them yet. Retrying every 10 seconds.")
         : "Point Deck at a directory, an existing repository, or a repository to clone.";
   const bodyTone = failed ? "text-error" : "text-text-tertiary";
-  // `unread` renders no action: a create button over a registry nobody
-  // has read offers onboarding against a database whose state is
-  // unknown, which is the no-project claim this state must not make.
-  const actionHtml = state.kind === "unread"
-    ? ""
-    : `<button type="button" data-empty-action data-hint="${escapeHtml(actionHint)}"
+  const detail = state.kind === "error" && error !== ""
+    ? `<p data-empty-detail class="max-w-[44ch] text-caption text-error">${escapeHtml(error)}</p>`
+    : "";
+  const actionHtml = `<button type="button" data-empty-action data-hint="${escapeHtml(actionHint)}"
           class="mt-(--space-2) h-9 rounded-control bg-accent px-3 text-body-sm font-medium text-text-on-accent transition-colors hover:bg-accent-hover pointer-coarse:min-h-11 focus-visible:bg-wash-hover">${action}</button>`;
   return `
-    <div data-empty-pane="${state.kind}" class="grid h-full place-items-center px-6 pb-[7%] text-center font-ui font-normal tracking-normal">
+    <div data-empty-pane="${state.kind}" ${state.kind === "error" ? 'role="alert"' : ""} class="grid h-full place-items-center px-6 pb-[7%] text-center font-ui font-normal tracking-normal">
       <!-- Optical, not geometric, centring: a block held at the pane's
            exact middle sits mid-void in a tall window and reads as still
            loading, so the bottom padding lifts the composition's centre
            above the pane's. -->
       <div class="flex flex-col items-center gap-(--space-3)">
-        <span aria-hidden="true" class="text-text-tertiary">${lucideIcon(icon, 20)}</span>
+        <span aria-hidden="true" class="${iconTone}">${lucideIcon(icon, 20)}</span>
         <h2 data-empty-title class="text-title-3 font-title-caps text-text-primary">${title}</h2>
         <p data-empty-body class="max-w-[44ch] text-body-sm ${bodyTone}">${body}</p>
+        ${detail}
         ${actionHtml}
       </div>
+    </div>`;
+}
+
+// The loading pane is not a member of the empty family: no icon, no
+// title, no action — a spinner and one line, because the page has nothing
+// to report yet and an empty-state shape here is what reads as "lost". It
+// keeps the family's surface and lift so the settled state lands in place.
+function loadingPaneHtml(phase: LoadingPhase, session: string | null, cached: boolean): string {
+  const spinner = `<span aria-hidden="true" class="block h-[13px] w-[13px] flex-none animate-spinner rounded-circle border-[1.5px] border-border-strong border-t-text-secondary"></span>`;
+  const line = session !== null
+    ? `Reattaching to <em>${escapeHtml(session)}</em>…`
+    : "Reconnecting to your sessions…";
+  const content = phase === "reconnect"
+    ? `<div class="flex items-center gap-(--space-3) text-body-sm text-text-secondary">${spinner}<span data-empty-line>${line}</span></div>`
+    : `<div class="flex flex-col items-center gap-(--space-2)">
+        <div class="flex items-center gap-(--space-3) text-body-sm text-text-primary">${spinner}<span data-empty-line>Still reaching the runtime</span></div>
+        <p data-empty-body class="max-w-[44ch] text-caption text-text-secondary">${
+          cached
+            ? "These are your sessions as of your last visit. They keep running on the server while this page reconnects."
+            : "Sessions keep running on the server while this page reconnects. Nothing has been closed."
+        }</p>
+      </div>`;
+  return `
+    <div data-empty-pane="loading" data-empty-phase="${phase}" role="status" aria-busy="true" class="grid h-full place-items-center px-6 pb-[7%] text-center font-ui font-normal tracking-normal">
+      ${content}
     </div>`;
 }
 

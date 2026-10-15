@@ -32,6 +32,8 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 // operator to look at the run history.
 func (h *Handler) generateErr(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, ErrGenerationUnsupported):
+		h.err(w, http.StatusNotImplemented, "generation_unsupported", err.Error())
 	case errors.Is(err, project.ErrNotFound):
 		h.err(w, http.StatusNotFound, "not_found", "project not found")
 	case errors.Is(err, ErrUnsafeTree), errors.Is(err, ErrNotTaskmasterProject), errors.Is(err, ErrTaskStateBlocked):

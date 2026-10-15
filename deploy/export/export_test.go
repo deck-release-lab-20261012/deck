@@ -29,6 +29,9 @@ skills/install-deck/SKILL.md`
 var excludedPaths = []string{
 	"AGENTS.md", "SDLC.md", ".noise/", ".tasks/", "docs/internal/",
 	".github/workflows/harness-bump.yaml", ".github/workflows/harness-bump-merge.yaml",
+	".github/workflows/ci-heal.yaml",
+	"internal/ciheal/",
+	"deploy/export/ciheal_private_test.go", "deploy/ciheal_workflow_private_test.go",
 	"deploy/harness_batch_test.go", "deploy/harness_review_source_test.go",
 	"deploy/systemd/", "deploy/runner_watchdog_test.go",
 	"deploy/ci_workflow_private_test.go", "deploy/subscription_review_private_test.go",

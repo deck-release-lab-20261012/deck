@@ -724,6 +724,9 @@ class HookForwarderTest(unittest.TestCase):
             # The harness name a2a records is the Deck provider id, claude:
             # the agent's handle is derived from it on both sides.
             self.assertIn(f"/opt/mempalace/hooks/a2a-hook.sh {lifecycle} claude", commands, event)
+        claude_settings = json.loads((self.home / ".claude" / "settings.json").read_text())
+        self.assertEqual(claude_settings.get("crossSessionInbound"), "accept",
+                         "without accept the courier's socket posts wait on an approval dialog")
         self.assertTrue((self.home / ".pi" / "agent" / "extensions" / "a2a.js").is_file())
 
         source_hook = (HOOKS / "mempal-pi-hook.js").read_bytes()
@@ -757,6 +760,8 @@ class HookForwarderTest(unittest.TestCase):
         self.assertFalse((self.home / ".codex" / "skills" / "mempalace").exists())
         self.assertFalse((self.home / ".pi" / "agent" / "extensions" / "mempalace.js").exists())
         self.assertFalse((self.home / ".codex" / "AGENTS.md").exists())
+        claude = json.loads((self.home / ".claude" / "settings.json").read_text())
+        self.assertNotIn("crossSessionInbound", claude, "removal leaves no a2a setting behind")
 
     def test_configure_upgrades_chat_instructions_without_changing_user_text(self):
         skills = self.root / "skills"

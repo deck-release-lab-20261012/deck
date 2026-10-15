@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +30,13 @@ type jobEnv struct {
 	projects *project.Repository
 	project  *project.Project
 	tmux     *tmux.Client
+}
+
+func requireGenerationSupport(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("PRD generation transport is Linux-only; native refusal is tested separately")
+	}
 }
 
 // newJobEnv registers a project with an initialized store marker and one PRD,
@@ -154,6 +162,7 @@ func (e *jobEnv) awaitRun(t *testing.T, id string) *Run {
 }
 
 func TestGenerateCapturesExitAndOutput(t *testing.T) {
+	requireGenerationSupport(t)
 	stub := writeStub(t, "echo \"parsed: $*\"\nsleep 0.2\nexit 3")
 	e := newJobEnv(t, stub)
 
@@ -200,6 +209,7 @@ func TestGenerateCapturesExitAndOutput(t *testing.T) {
 }
 
 func TestGenerateSerializesPerProject(t *testing.T) {
+	requireGenerationSupport(t)
 	stub := writeStub(t, "sleep 30")
 	e := newJobEnv(t, stub)
 
@@ -224,6 +234,7 @@ func TestGenerateSerializesPerProject(t *testing.T) {
 }
 
 func TestGenerateRefusesUninitializedStoreBeforeCreatingRun(t *testing.T) {
+	requireGenerationSupport(t)
 	e := newJobEnv(t, writeStub(t, "exit 29"))
 	removeStubStore(t, e)
 
@@ -240,6 +251,7 @@ func TestGenerateRefusesUninitializedStoreBeforeCreatingRun(t *testing.T) {
 }
 
 func TestGenerateRejectsIneligiblePRD(t *testing.T) {
+	requireGenerationSupport(t)
 	stub := writeStub(t, "exit 0")
 	e := newJobEnv(t, stub)
 	for _, name := range []string{"missing.md", "../PRD.md", "docs/PRD.md", "PRD.txt", ""} {
@@ -252,6 +264,7 @@ func TestGenerateRejectsIneligiblePRD(t *testing.T) {
 // A LISTED prd whose file is a symlink out of the root passes eligibility
 // (names only) but must be refused before launch.
 func TestGenerateRefusesPRDSymlinkEscape(t *testing.T) {
+	requireGenerationSupport(t)
 	stub := writeStub(t, "exit 0")
 	e := newJobEnv(t, stub)
 	outside := filepath.Join(t.TempDir(), "secret.md")
@@ -274,6 +287,7 @@ func TestGenerateRefusesPRDSymlinkEscape(t *testing.T) {
 // so the generation contract pins two descriptors across a hostile rename:
 // the project root the handoff fchdirs into, and the already-open PRD.
 func TestGenerateRetainsDescriptorsAcrossDirectorySwaps(t *testing.T) {
+	requireGenerationSupport(t)
 	for _, swapRoot := range []bool{false, true} {
 		swapName := "descendant"
 		if swapRoot {
@@ -333,6 +347,7 @@ func TestGenerateRetainsDescriptorsAcrossDirectorySwaps(t *testing.T) {
 }
 
 func TestGenerateLaunchFailureIsHonest(t *testing.T) {
+	requireGenerationSupport(t)
 	e := newJobEnv(t, "/nonexistent/noise")
 	_, err := e.runner.Generate(context.Background(), e.project.ID, "PRD.md")
 	// Context resolution uses the same fixed engine. An unavailable engine
@@ -350,6 +365,7 @@ func TestGenerateLaunchFailureIsHonest(t *testing.T) {
 }
 
 func TestReconcileFinalizesAfterWatcherLoss(t *testing.T) {
+	requireGenerationSupport(t)
 	stub := writeStub(t, "echo done\nexit 0")
 	e := newJobEnv(t, stub)
 
@@ -387,6 +403,7 @@ func TestReconcileFinalizesAfterWatcherLoss(t *testing.T) {
 // A split window changes the session's CURRENT pane; reconciliation must
 // still find the ORIGINAL pane by its marker and leave the run running.
 func TestReconcileIgnoresCurrentPaneConfusion(t *testing.T) {
+	requireGenerationSupport(t)
 	stub := writeStub(t, "sleep 30")
 	e := newJobEnv(t, stub)
 
@@ -429,6 +446,7 @@ func TestReconcileIgnoresCurrentPaneConfusion(t *testing.T) {
 }
 
 func TestReconcileGoneSessionIsUnobservedNotInvented(t *testing.T) {
+	requireGenerationSupport(t)
 	stub := writeStub(t, "sleep 30")
 	e := newJobEnv(t, stub)
 
@@ -462,6 +480,7 @@ func TestReconcileGoneSessionIsUnobservedNotInvented(t *testing.T) {
 // The endpoints: 202 on start, 409 while one runs, 400 on a bad PRD,
 // slim list, full detail, no cross-project reads.
 func TestJobEndpoints(t *testing.T) {
+	requireGenerationSupport(t)
 	stub := writeStub(t, "echo hi\nexit 0")
 	e := newJobEnv(t, stub)
 

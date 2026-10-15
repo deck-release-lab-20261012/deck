@@ -26,6 +26,7 @@ import {
   kindOfName,
   projectPathPrefix,
   projectRootLabel,
+  rowChange,
   rowMeta,
   rowName,
   splitFileName,
@@ -568,6 +569,13 @@ test("any other view failure surfaces the server's message", async () => {
 });
 
 // ---- metadata voices ----
+
+test("a row's git marker is the listing's words, and nothing when unreported", () => {
+  assert.equal(rowChange({ ...entry("a.go"), change: "modified" }), "Modified");
+  assert.equal(rowChange({ ...entry("src", true), change: "modified" }), "Modified");
+  assert.equal(rowChange({ ...entry("b.go"), change: "new" }), "New");
+  assert.equal(rowChange(entry("c.go")), "");
+});
 
 test("row and viewer metadata state only what the listing reported", () => {
   assert.equal(rowName(entry("docs", true)), "docs/");
@@ -1800,4 +1808,22 @@ test("the shell escapes the names and paths the server returned", async () => {
   const { box } = await shellShowing(nasty, api);
   assert.equal(box.html().includes("<img"), false, "no tag survives");
   assert.ok(box.html().includes("&lt;img"), "it renders as visible text instead");
+});
+
+test("marked rows show their words as text and carry no nested data-hints", async () => {
+  const marked: FileListing = {
+    path: "",
+    at_root: true,
+    entries: [
+      { ...entry("docs", true), change: "modified" },
+      { ...entry("README.md"), change: "modified" },
+      { ...entry("fresh.txt"), change: "new" },
+    ],
+  };
+  const { api } = fakeFileApi({ listProjectFiles: async () => marked });
+  const { box } = await shellShowing(entry("README.md"), api);
+  const html = box.html();
+  assert.match(html, /data-files-change="modified"[^>]*>Modified</);
+  assert.match(html, /data-files-change="new"[^>]*>New</);
+  assertNoNestedDataHints(html, "marked rows");
 });

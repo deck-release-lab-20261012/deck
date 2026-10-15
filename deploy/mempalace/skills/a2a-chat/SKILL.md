@@ -44,9 +44,9 @@ available through `reply`, `read`, and `inbox` across projects.
 Native receive paths may bring the answer as a prompt beginning `[a2a]`.
 Automatic chat never types into terminal input. A harness without a supported
 native receive path keeps the message unread; an idle peer is not guaranteed
-to wake. Claude and Kimi are two: their hooks fire at a turn's edges, so an
-idle agent there sees your message when its operator next types — at that
-turn's start — and `a2a chat` says so when it addresses such a peer. When
+to wake. Kimi is one: its hooks fire at a turn's edges, so an idle Kimi agent
+sees your message when its operator next types — at that turn's start — and
+`a2a chat` says so when it addresses such a peer. When
 you are the one waiting on peers run `a2a wait` yourself. Use `a2a inbox`
 to read replies or block when the answer is required:
 

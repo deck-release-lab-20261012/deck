@@ -36,6 +36,15 @@ const (
 // converge and authorizes cleanup, while ambiguity authorizes nothing.
 var errAmbiguousCandidate = errors.New("session: candidate pane is ambiguous")
 
+// abortedByContext reports whether a recovery error is the CALLER's
+// schedule ending the flight — the sweep budget, a shutdown — rather than
+// an answer from the provider or the environment. Only the schedule's own
+// aborts give the admission back: everything else is a real answer the
+// operator owns.
+func abortedByContext(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 func launchShape(s *Session, desc provider.Descriptor) (noIdentity, freshLaunch bool) {
 	noIdentity = s.NativeSessionID == nil || *s.NativeSessionID == ""
 	if desc.IdentityContract() == provider.IdentityNone ||
@@ -307,7 +316,8 @@ func (m *Manager) recover(ctx context.Context, id, suppliedWorkDir string,
 	return m.recoverAdmitted(ctx, id, suppliedWorkDir, operator)
 }
 
-func (m *Manager) recoverAdmitted(ctx context.Context, id, suppliedWorkDir string, operator bool) (*Session, error) {
+func (m *Manager) recoverAdmitted(ctx context.Context, id, suppliedWorkDir string,
+	operator bool) (rs *Session, rerr error) {
 	if m.leases == nil {
 		return nil, errors.New("session: recovery fencing is not wired")
 	}
@@ -421,6 +431,22 @@ func (m *Manager) recoverAdmitted(ctx context.Context, id, suppliedWorkDir strin
 				return nil, prepareErr
 			}
 			credential, grant = preparedCredential, &preparedGrant
+		} else if startupResumeCapture(desc) {
+			// omp's session_start fires on a resumed process and carries
+			// the resumed id with the same startup-shaped source a fresh
+			// launch posts, so the resume takes the same generation-bound
+			// startup grant a fresh launch takes. Identity is captured
+			// exactly as at launch; a resume-shaped grant would demand a
+			// distinction the pinned hook does not emit.
+			if m.captures == nil || m.captureURLBase == "" {
+				return nil, ErrNotResumable
+			}
+			preparedCredential, preparedGrant, prepareErr := m.captures.PrepareLaunchGrant(
+				source.ID, source.Provider, workDir, source.Generation+1, marker)
+			if prepareErr != nil {
+				return nil, prepareErr
+			}
+			credential, grant = preparedCredential, &preparedGrant
 		}
 	}
 	slot, err := m.repo.BeginSuccessorSlot(gctx, source, marker, grant, freshAssignedID)
@@ -428,8 +454,16 @@ func (m *Manager) recoverAdmitted(ctx context.Context, id, suppliedWorkDir strin
 		return nil, err
 	}
 	failBeforeSpawn := func(stage string, cause error) (*Session, error) {
+		// The unwind must outlive the context that aborted the flight. The
+		// sweep budget expiring mid-admission is the ordinary way to arrive
+		// here, and a rollback run under that same expired context fails at
+		// its first database write — leaving the successor slot and the
+		// spent opportunity on the row, which excludes the session from
+		// every later sweep for good.
+		wctx, cancelW := context.WithTimeout(context.WithoutCancel(gctx), recoveryCleanupBound)
+		defer cancelW()
 		if grant != nil {
-			if _, revokeErr := m.captures.RevokeFencedState(gctx, id,
+			if _, revokeErr := m.captures.RevokeFencedState(wctx, id,
 				slot.CandidateGeneration, slot.CandidateIdentityMarker); revokeErr != nil {
 				return nil, errors.Join(cause, revokeErr)
 			}
@@ -438,12 +472,26 @@ func (m *Manager) recoverAdmitted(ctx context.Context, id, suppliedWorkDir strin
 			"before_spawn=%s provider=%s source_generation=%d candidate_generation=%d error_class=%s",
 			stage, source.Provider, source.Generation, slot.CandidateGeneration,
 			recoveryErrorClass(cause))
-		_, retireErr := m.repo.RetireSuccessorSlot(gctx, slot, diagnostic)
 		var tempErr error
 		if tempReady {
 			tempErr = m.removeGenerationTemp(id, slot.CandidateGeneration,
 				slot.CandidateIdentityMarker)
 		}
+		// The flight's own context names the abort, not the error: tmux
+		// wraps command failures into formatted strings that drop the
+		// context chain, so a deadline that surfaced through a tmux call
+		// would otherwise read as a deterministic failure and spend the
+		// opportunity on nothing.
+		if abortedByContext(cause) || gctx.Err() != nil {
+			// Nothing was launched, so the provider answered nothing: the
+			// attempt returns to the next sweep pass, and the series count
+			// alone bounds the retry loop.
+			_, returnErr := m.repo.ReturnAbortedRecoveryOpportunity(wctx, slot,
+				source.NativeSessionID,
+				"automatic recovery aborted before launch: "+diagnostic)
+			return nil, errors.Join(ErrNotResumable, cause, returnErr, tempErr)
+		}
+		_, retireErr := m.repo.RetireSuccessorSlot(wctx, slot, diagnostic)
 		return nil, errors.Join(ErrNotResumable, cause, retireErr, tempErr)
 	}
 	if !configured {
@@ -550,8 +598,95 @@ func (m *Manager) recoverAdmitted(ctx context.Context, id, suppliedWorkDir strin
 	var (
 		info     *tmux.PaneInfo
 		spawnErr error
-		name     string
+		// spawnedInfo holds the spawn's own observation for the abort
+		// resolver; assigned once the spawn completes below.
+		spawnedInfo *tmux.PaneInfo
+		name        string
 	)
+	// The abort resolver: when the caller's SCHEDULE — the sweep budget, a
+	// per-recovery gate — ends the flight after the candidate was
+	// launched, every intermediate step from stabilization to attestation
+	// unwinds with a context error, and unwinding under that same expired
+	// context would leave an open successor slot and a spent opportunity:
+	// the state that excludes a session from every later sweep. This
+	// resolver runs under a context that survives the caller's deadline and
+	// decides from observation, not from the error: a candidate still
+	// proven ours and alive commits (attestation is confirmation, not
+	// permission, and discarding a healthy pane to satisfy a schedule would
+	// destroy the work recovery exists to preserve), while a candidate that
+	// died records the provider's answer. A candidate that cannot be proven
+	// ours at all is left exactly as a crash between the steps would have
+	// left it — provisional pane, open slot — for the converger to resolve;
+	// no retry is scheduled for it here.
+	//
+	// A deliberate CANCELLATION — a shutdown, an operator abandoning the
+	// click, a workspace lock quiescing the cohort — is not a schedule
+	// running out, and the resolver declines it: the stopper may want the
+	// workspace quiet, and the unresolved live successor is what makes the
+	// workspace lock refuse until the converger has resolved the candidate.
+	// Pre-spawn there is nothing to keep quiet, so failBeforeSpawn hands a
+	// cancelled admission back on its own; everything this resolver sees is
+	// post-launch, where name is always assigned.
+	defer func() {
+		if !abortedByContext(rerr) && gctx.Err() == nil {
+			// Not a schedule abort. Like failBeforeSpawn, the flight's own
+			// context is the authority: tmux drops the context chain when
+			// it wraps command failures.
+			return
+		}
+		if gctx.Err() == context.Canceled {
+			return
+		}
+		wctx, cancelW := context.WithTimeout(context.WithoutCancel(gctx), recoveryCleanupBound)
+		defer cancelW()
+		open, err := m.repo.SuccessorSlot(wctx, source.ID)
+		if err != nil || open == nil {
+			// Committed, refused, retired, or already unwound elsewhere.
+			return
+		}
+		observed, observeErr := m.tmux.PaneInfoForSession(wctx, name)
+		if observeErr == nil {
+			observeErr = verifySuccessorPane(open, name, observed)
+			if observeErr != nil {
+				// A flight parked between spawning and recording its
+				// process tuple leaves the slot nothing to verify against;
+				// the spawn's own observation is the proof that flight had.
+				observeErr = verifySpawnedCandidate(open, name, observed, spawnedInfo)
+			}
+		}
+		if observeErr != nil {
+			// The candidate cannot be proven ours under a surviving
+			// context; the converger resolves the provisional pane exactly
+			// as a crash between the steps would have.
+			return
+		}
+		if observed.Dead {
+			// A pane read after death carries no group or start ticks, so
+			// the refusal records the tuple proved while the candidate was
+			// alive: the slot's recording when there is one, else the
+			// spawn observation. The PID match above is what licenses
+			// carrying either over.
+			corpse := *observed
+			switch {
+			case open.CandidateProcessGroupID != nil && *open.CandidateProcessGroupID > 1:
+				corpse.ProcessGroupID, corpse.StartTicks =
+					*open.CandidateProcessGroupID, *open.CandidateStartTicks
+			case spawnedInfo != nil && spawnedInfo.ProcessGroupID > 1:
+				corpse.ProcessGroupID, corpse.StartTicks =
+					spawnedInfo.ProcessGroupID, spawnedInfo.StartTicks
+			}
+			if !freshLaunch && corpse.ProcessGroupID > 1 && corpse.StartTicks > 0 {
+				rs, rerr = m.recordRefusedResume(wctx, source, open, name,
+					expected, bootEpoch, &corpse, spawnErr)
+				return
+			}
+			rs, rerr = m.retireObservedSuccessor(wctx, source, open, &corpse,
+				errors.Join(spawnErr, errors.New("successor exited before commit")))
+			return
+		}
+		rs, rerr = m.commitSuccessor(wctx, source, open, name,
+			expected, bootEpoch, observed, !freshLaunch)
+	}()
 	if pane := m.reusableRecoveryPane(gctx, source); pane != nil {
 		name, spec.Name = pane.SessionName, pane.SessionName
 		info, spawnErr = m.tmux.RespawnPane(gctx, pane.PaneID, spec)
@@ -576,6 +711,11 @@ func (m *Manager) recoverAdmitted(ctx context.Context, id, suppliedWorkDir strin
 		}
 		info = observed
 	}
+	// The spawn's own observation, kept for the abort resolver: a flight
+	// parked between spawning and recording the process tuple leaves the
+	// slot nothing to verify a corpse against, and this is the proof that
+	// flight had.
+	spawnedInfo = info
 	// Pin the spawn's process identity before any path may adopt this pane.
 	// Until this lands the slot proves nothing, which is the honest state: a
 	// crash here leaves a candidate nobody may claim rather than one a later
@@ -640,6 +780,11 @@ func (m *Manager) recoverAdmitted(ctx context.Context, id, suppliedWorkDir strin
 		!resumeHookAfterFirstSubmission(desc) {
 		state, died, waitErr := m.waitForResumeAttestation(gctx, slot, name, info)
 		if waitErr != nil {
+			// A context error here is the caller's schedule, not the
+			// provider: the abort resolver installed above re-observes the
+			// candidate under a surviving context and commits a pane still
+			// proven ours and alive. Any other failure of the wait unwinds
+			// on its own.
 			return nil, errors.Join(spawnErr, waitErr)
 		}
 		if died != nil {
@@ -800,6 +945,28 @@ func resumeAttestationSource(desc provider.Descriptor) (string, bool) {
 	return "", false
 }
 
+// startupResumeCapture reports whether a provider's resume flight reports
+// identity through the same process-launch callback a fresh launch uses.
+// The source string is matched byte-for-byte, the same standard
+// resumeAttestationSource holds claude to: Deck never renames a startup
+// callback a resume.
+func startupResumeCapture(desc provider.Descriptor) bool {
+	capturer, ok := desc.(provider.StartupResumeCaptureDescriptor)
+	if !ok || capturer.ResumeCaptureHookSource() != hookcapture.ExpectedSourceStartup {
+		return false
+	}
+	captures, ok := desc.(provider.IdentityCaptureDescriptor)
+	if !ok {
+		return false
+	}
+	for _, mechanism := range captures.IdentityCaptureMechanisms() {
+		if mechanism == provider.IdentityCaptureStructuredNativeHook {
+			return true
+		}
+	}
+	return false
+}
+
 // resumeHookAfterFirstSubmission only defers a declared structured resume
 // hook with known late timing. Unknown timing keeps the existing bounded wait.
 func resumeHookAfterFirstSubmission(desc provider.Descriptor) bool {
@@ -905,6 +1072,32 @@ func (m *Manager) awaitDeadPaneEvidence(ctx context.Context, dead *tmux.PaneInfo
 		}
 	}
 	return dead
+}
+
+// verifySpawnedCandidate proves an observed pane is this recovery's
+// candidate when the slot has no recorded process tuple — the flight parked
+// between spawning and recording, or died in between. The pane's retained
+// PID must equal the spawn's live PID (an operator who reclaimed and
+// re-exited the pane answers a different one), and the pane's marker options
+// must still name the candidate generation.
+func verifySpawnedCandidate(slot *SuccessorSlot, name string, observed, spawned *tmux.PaneInfo) error {
+	if slot == nil || observed == nil || spawned == nil ||
+		observed.SessionName != name || observed.PID <= 1 ||
+		observed.PID != spawned.PID ||
+		observed.Generation != slot.CandidateGeneration ||
+		observed.Marker != slot.CandidateIdentityMarker ||
+		observed.LaunchMarker != slot.CandidateIdentityMarker {
+		return ErrIdentityMismatch
+	}
+	if observed.Dead {
+		return nil
+	}
+	if observed.ProcessGroupID <= 1 || observed.StartTicks <= 0 ||
+		observed.ProcessGroupID != spawned.ProcessGroupID ||
+		observed.StartTicks != spawned.StartTicks {
+		return ErrIdentityMismatch
+	}
+	return nil
 }
 
 // verifySuccessorPane proves a pane holds the candidate this recovery

@@ -1,6 +1,7 @@
 package project
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -251,6 +252,7 @@ func (h *Handler) ListFiles(w http.ResponseWriter, r *http.Request) {
 		h.fileError(w, err)
 		return
 	}
+	annotateChanges(r.Context(), root, listing)
 	h.json(w, http.StatusOK, listing)
 }
 
@@ -272,8 +274,11 @@ const filesEventsInterval = 2 * time.Second
 
 // FilesEvents keeps one directory listing live. ListFiles owns path
 // validation and descriptor-based confinement; the fingerprint is only the
-// metadata the listing already disclosed, so an edit in place is visible
-// without treating the directory's own mtime as the source of truth.
+// metadata and change markers the listing already disclosed, so an edit in
+// place is visible without treating the directory's own mtime as the source
+// of truth. Each tick runs one bounded git status (gitStatusTimeout,
+// gitStatusMaxOutput), so a stalled or huge status delays that tick rather
+// than piling up work.
 func (h *Handler) FilesEvents(w http.ResponseWriter, r *http.Request) {
 	root, ok := h.projectRoot(w, r)
 	if !ok {
@@ -304,7 +309,7 @@ func (h *Handler) FilesEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	last, _ := filesFingerprint(root, rel)
+	last, _ := filesFingerprint(r.Context(), root, rel)
 	missing := false
 	ticker := time.NewTicker(filesEventsInterval)
 	defer ticker.Stop()
@@ -313,7 +318,7 @@ func (h *Handler) FilesEvents(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-ticker.C:
-			current, err := filesFingerprint(root, rel)
+			current, err := filesFingerprint(r.Context(), root, rel)
 			if err != nil {
 				if !missing {
 					missing = true
@@ -335,14 +340,16 @@ func (h *Handler) FilesEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func filesFingerprint(root, rel string) (string, error) {
+func filesFingerprint(ctx context.Context, root, rel string) (string, error) {
 	listing, err := ListFiles(root, rel)
 	if err != nil {
 		return "", err
 	}
+	annotateChanges(ctx, root, listing)
 	var fingerprint strings.Builder
 	for _, entry := range listing.Entries {
 		fmt.Fprintf(&fingerprint, "%s\x00%d\x00%s\x00%t\x00", entry.Name, entry.Size, entry.MTime, entry.Dir)
+		fmt.Fprintf(&fingerprint, "%s\x00", entry.Change)
 	}
 	return fingerprint.String(), nil
 }

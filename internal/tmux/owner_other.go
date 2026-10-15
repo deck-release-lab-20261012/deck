@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 package tmux
 
@@ -8,9 +8,7 @@ import (
 	"runtime"
 )
 
-// verifyOwnedByRuntimeUser is unavailable off Linux and fails closed,
-// matching processIdentity: a build that skipped the socket-ownership check
-// would be weaker than the rule while appearing to satisfy it.
+// Unsupported hosts cannot skip socket ownership verification.
 func verifyOwnedByRuntimeUser(path string, _ os.FileInfo) error {
 	return fmt.Errorf(
 		"tmux: socket ownership verification is not implemented on %s; cannot "+

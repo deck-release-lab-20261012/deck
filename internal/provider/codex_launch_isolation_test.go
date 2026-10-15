@@ -11,7 +11,7 @@ func TestCodexLaunchIsolationCompleteArgv(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, skip := range []bool{false, true} {
-		base := []string{d.Executable(), "--no-daemon"}
+		base := []string{d.Executable(), "--no-daemon", "--no-alt-screen"}
 		if skip {
 			base = append(base, "--dangerously-bypass-approvals-and-sandbox")
 		}

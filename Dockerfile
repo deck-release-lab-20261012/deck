@@ -9,8 +9,8 @@ ARG NOISE_SDLC_VERSION=0.3.0
 
 ARG KIMI_VERSION=2.1.1
 ARG OPENCODE_VERSION=1.19.0
-ARG COMMAND_CODE_VERSION=1.79.2
-ARG CLINE_VERSION=3.0.70
+ARG COMMAND_CODE_VERSION=1.81.0
+ARG CLINE_VERSION=3.0.71
 ARG KILO_VERSION=7.8.8
 ARG QWEN_VERSION=0.25.1
 ARG CRUSH_VERSION=0.98.1
@@ -536,15 +536,15 @@ ARG CLINE_VERSION
 ARG KILO_VERSION
 ARG QWEN_VERSION
 ARG MIMO_VERSION=0.1.15
-ARG QODER_VERSION=1.1.68
+ARG QODER_VERSION=1.1.70
 ARG CURSOR_AGENT_VERSION=2026.10.01-e373342
 ARG CURSOR_AGENT_SHA256_AMD64=a79726c6e644520e993970be4c45775a6889802b67abe461a677a53219ae28e8
 ARG CURSOR_AGENT_SHA256_ARM64=785c5f6bf2a60eb1121e27ed8c14f5ee07ed1b5b6692324f2d9a997238245eb5
-ARG GROK_VERSION=1.0.50
+ARG GROK_VERSION=1.0.52
 ARG BUN_VERSION=1.3.14
-ARG OMP_VERSION=18.10.1
+ARG OMP_VERSION=18.10.3
 ARG CRUSH_VERSION
-ARG PI_VERSION=1.1.0
+ARG PI_VERSION=1.2.0
 ARG DEVIN_VERSION=3000.11.3
 ARG DEVIN_SHA256_AMD64=83b3b113c01bf2a3e9e100db08d77e6b086806a7754f091e20831bdfe215157e
 ARG DEVIN_SHA256_ARM64=21a2d7a8dea67987067cde7eb3fe7193a48daa8f8c3d50d414c603c4a2b67f15
@@ -817,8 +817,10 @@ COPY deploy/mempalace/hook_forwarder.py /usr/local/lib/noisedeck/mempalace-hook-
 COPY deploy/mempalace/hooks/ /opt/mempalace/hooks/
 COPY deploy/a2a/a2a.py /usr/local/bin/a2a
 COPY scripts/task-hygiene.sh /usr/local/bin/noisedeck-task-hygiene
+COPY scripts/model-offer/model-offer.sh /usr/local/bin/noisedeck-model-offer
 COPY deploy/mempalace/noisedeck-bootstrap /usr/local/bin/noisedeck-bootstrap
 RUN chmod 0555 /usr/local/bin/noisedeck-bootstrap /usr/local/bin/a2a /usr/local/bin/noisedeck-task-hygiene \
+    /usr/local/bin/noisedeck-model-offer \
     /usr/local/lib/noisedeck/configure-mempalace.py \
     /usr/local/lib/noisedeck/mempalace-hook-forwarder.py /opt/mempalace/hooks/*.sh \
     && chmod 0444 /opt/mempalace/hooks/*.js

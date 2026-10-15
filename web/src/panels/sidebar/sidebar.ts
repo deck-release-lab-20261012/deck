@@ -27,6 +27,7 @@ import { formatSince } from "../../lib/format.ts";
 import { isVerifiedRunningSession, sessionNeedsAttention, sessionStaysListed } from "../../ui/session-status.ts";
 import { applyAutoColors } from "../../lib/auto-color.ts";
 import { operatorProjectColorKey } from "../../lib/session-colors.ts";
+import { readListCache, writeListCache, type ListCacheStorage } from "./list-cache.ts";
 
 // ProjectWithSessions is one sidebar row group.
 export interface ProjectWithSessions {
@@ -159,11 +160,23 @@ export interface SidebarCallbacks {
   onError?: (message: string, cause?: unknown) => void;
 }
 
+// ListState is the rail's three-valued answer to "what does the server
+// say?": `loading` until the first read settles, `ready` after a read
+// succeeded, `error` after the latest read failed. Empty states render only
+// from `ready`; the other two draw the shell and say what is happening.
+export type ListState = "loading" | "ready" | "error";
+
 export class SidebarModel {
   groups: ProjectWithSessions[] = [];
   gitIdentities: GitIdentityCatalog | null = null;
   selectedSessionID: string | null = null;
   loading = false;
+  listState: ListState = "loading";
+  // stale marks groups the server has not confirmed: the previous visit's
+  // cached list on a cold load, or the last served list outliving a failed
+  // read. Stale rows draw dimmed and inert — the operator can see what was
+  // there, and nothing on the page claims it still is.
+  stale = false;
   private createSessionInFlight = false;
   private refreshGeneration = 0;
   private inventoryGeneration = 0;
@@ -199,11 +212,24 @@ export class SidebarModel {
   readonly api: ApiClient;
   private cb: SidebarCallbacks;
   private autoColorProjects: boolean;
+  private listCache: ListCacheStorage | null;
 
-  constructor(api: ApiClient, cb: SidebarCallbacks = {}, autoColorProjects = false) {
+  constructor(
+    api: ApiClient,
+    cb: SidebarCallbacks = {},
+    autoColorProjects = false,
+    listCache: ListCacheStorage | null = null,
+  ) {
     this.api = api;
     this.cb = cb;
     this.autoColorProjects = autoColorProjects;
+    this.listCache = listCache;
+    const cached = listCache === null ? null : readListCache(listCache);
+    if (cached !== null && cached.length > 0) {
+      this.groups = cached;
+      applyAutoColors(this.groups, this.autoColorProjects);
+      this.stale = true;
+    }
   }
 
   get creatingSession(): boolean {
@@ -228,8 +254,11 @@ export class SidebarModel {
   // refresh reloads projects and each project's sessions. A project that
   // fails its sessions fetch keeps its place with an error marker; a
   // failed projects fetch surfaces through onError and keeps the last
-  // good state. Harnesses become visible as soon as their independent
-  // request finishes; session reconciliation must not hold up the picker.
+  // served list as stale: the server being unreachable is not the server
+  // saying the sessions are gone, so nothing is dropped and nothing is
+  // deselected until a read succeeds. Harnesses become visible as soon as
+  // their independent request finishes; session reconciliation must not
+  // hold up the picker.
   async refresh(): Promise<void> {
     const generation = ++this.refreshGeneration;
     this.loading = true;
@@ -258,21 +287,19 @@ export class SidebarModel {
       if (generation !== this.refreshGeneration) return;
       this.groups = groups;
       applyAutoColors(this.groups, this.autoColorProjects);
+      this.stale = false;
+      this.listState = "ready";
       this.deselectUnavailableSession();
       this.gitIdentities = catalog;
       this.error = null;
       this.registryReadOk = true;
       this.confirmPendingSessionRemovals();
+      if (this.listCache !== null) writeListCache(this.listCache, this.groups);
     } catch (err) {
       if (generation !== this.refreshGeneration) return;
       const message = err instanceof Error ? err.message : String(err);
-      this.groups = this.groups.map(({ project }) => ({
-        project,
-        sessions: [],
-        loadError: message,
-      }));
-      applyAutoColors(this.groups, this.autoColorProjects);
-      this.deselectUnavailableSession();
+      this.stale = this.groups.length > 0;
+      this.listState = "error";
       this.error = message;
       this.registryReadOk = false;
       this.cb.onError?.(message, err);
@@ -434,7 +461,10 @@ export class SidebarModel {
       .find((candidate) => candidate.id === sessionID);
     // A listed session is a selectable session: limbo
     // rows select into the recovery surface; only rows off the list refuse.
-    if (session === undefined || !sessionStaysListed(session)) return false;
+    // A stale row is not listed by the server, so it refuses too: the rail
+    // draws it inert, and the keyboard must not reach what the pointer
+    // cannot.
+    if (this.stale || session === undefined || !sessionStaysListed(session)) return false;
     this.selectedSessionID = sessionID;
     this.cb.onSelectSession?.(sessionID, keyboard);
     return true;

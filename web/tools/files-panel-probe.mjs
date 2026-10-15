@@ -76,13 +76,14 @@ const MOBILE_TEXT = Array.from(
   (_, index) => `${String(index + 1).padStart(3, "0")} ${"mobile viewer content ".repeat(8)}`,
 ).join("\n");
 
-const entry = (path, dir, size) => ({
+const entry = (path, dir, size, change) => ({
   name: path.slice(path.lastIndexOf("/") + 1),
   path,
   dir,
   size,
   mode: dir ? "rwxr-xr-x" : "rw-r--r--",
   mtime: "2026-08-01T00:00:00Z",
+  ...(change === undefined ? {} : { change }),
 });
 
 // The listing the mock serves, in the server's own order (directories
@@ -90,14 +91,14 @@ const entry = (path, dir, size) => ({
 // shows what the server "stored".
 const listings = {
   "": [
-    entry("docs", true, 4096),
+    entry("docs", true, 4096, "modified"),
     entry("x", true, 4096),
     entry("broken", true, 4096),
     entry("deep", true, 4096),
     entry(LONG_DIR_NAME, true, 4096),
-    entry("README.md", false, README.length),
+    entry("README.md", false, README.length, "modified"),
     entry(LONG_FILE_NAME, false, README.length),
-    entry("logo.png", false, 18422),
+    entry("logo.png", false, 18422, "new"),
   ],
   "docs": [entry("docs/architecture.md", false, 331)],
   "x": [entry("x/y", true, 4096)],
@@ -169,6 +170,8 @@ try {
     if (request.method() === "GET" && path === `/api/sessions/${session.id}`) {
       return json(200, session);
     }
+    if (request.method() === "GET" && path === "/api/settings/last-session") return json(404, { code: "not_found", message: "no last session remembered" });
+    if (request.method() === "PUT" && path === "/api/settings/last-session") return json(200, request.postDataJSON());
     if (request.method() === "GET" && path === "/api/settings/layout") {
       return json(404, { code: "not_found", message: "no layout saved" });
     }
@@ -519,6 +522,14 @@ try {
     rowNames,
     ["docs/", "x/", "broken/", "deep/", `${LONG_DIR_NAME}/`, "README.md", LONG_FILE_NAME, "logo.png"],
     "directories first, server order",
+  );
+  const markers = await panel.locator("[data-files-row]").evaluateAll((rows) =>
+    rows.map((r) => [r.getAttribute("data-files-row"), r.querySelector("[data-files-change]")?.textContent.trim() ?? ""])
+      .filter(([, text]) => text !== ""));
+  assert.deepEqual(
+    markers,
+    [["docs", "Modified"], ["README.md", "Modified"], ["logo.png", "New"]],
+    "a modified file, the folder holding a changed file, and a new file each carry their marker as text",
   );
   const rowFont = await panel.locator("[data-files-row]").first()
     .evaluate((el) => {

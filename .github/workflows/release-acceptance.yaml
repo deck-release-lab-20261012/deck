@@ -21,6 +21,10 @@ permissions:
   actions: read
   contents: read
 
+env:
+  NOISE_TASKS_REPO: ${{ vars.NOISE_TASKS_REPO }}
+  NOISE_SDLC_REPO: ${{ vars.NOISE_SDLC_REPO }}
+
 concurrency:
   # Pushes coalesce: a newer merge supersedes the stale acceptance run.
   # Scheduled and dispatched certifications get a unique group so no

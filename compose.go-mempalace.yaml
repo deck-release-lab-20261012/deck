@@ -12,6 +12,8 @@ services:
         NOISEDECK_RUNTIME_UID: ${NOISEDECK_RUNTIME_UID:-1026}
         NOISEDECK_RUNTIME_GID: ${NOISEDECK_RUNTIME_GID:-100}
         NOISEDECK_FONTS: ${NOISEDECK_FONTS:-auto}
+        NOISE_TASKS_REPO: ${NOISE_TASKS_REPO:-https://github.com/noisefloor-oss/tasks.git}
+        NOISE_SDLC_REPO: ${NOISE_SDLC_REPO:-https://github.com/noisefloor-oss/sdlc.git}
     scale: 0
   app:
     build:

@@ -37,7 +37,9 @@ import {
   emptyTitlebarHtml,
   titlebarRightHtml,
   type EmptyPane,
+  type LoadingPhase,
 } from "../ui/empty-pane.ts";
+import { providerDisplayName } from "../ui/session-identity.ts";
 import { focusPanelTrigger, mountPanelsMenu } from "../ui/panel-trigger.ts";
 import { SECONDARY_SM_BUTTON } from "../ui/controls.ts";
 import { terminalIdentityHtml } from "../ui/terminal-identity.ts";
@@ -52,11 +54,10 @@ import { ChatsPanelModel, chatHandles, chatMarks } from "../panels/chats/chats-p
 import { ChatsPanel } from "../panels/chats/chats-panel-dom.ts";
 import { DockedPanels } from "./docked-panels.ts";
 import {
-  clearLastSession,
+  LastSessionMemory,
   type LastSessionStorage,
   pickInitialSession,
   readLastSession,
-  writeLastSession,
 } from "./last-session.ts";
 import { region, workspaceLayout } from "./layout.ts";
 import { TerminalFocusRequest } from "./terminal-focus.ts";
@@ -105,6 +106,8 @@ import {
 
 const statusRefreshMS = 3000;
 const sidebarRefreshMS = 10000;
+const loadingSlowAfterMS = 2000;
+const loadingFailedAfterMS = 10000;
 
 type AttachmentProblem = {
   kind: "takeover" | "fenced" | "leaseExpired" | "dropped" | "error" | "closed";
@@ -158,6 +161,16 @@ export class LiveWorkspace {
   private attachmentProblem: AttachmentProblem | null = null;
   private statusTimer: number | null = null;
   private sidebarTimer: number | null = null;
+  // The loading pane changes what it says with time (comp Workspace
+  // Loading State): "Reconnecting…" for two seconds, then "Still reaching
+  // the runtime", then after ten seconds the error state with its retry,
+  // whether or not the read has come back. These repaint it on that clock.
+  private loadingTimers: number[] = [];
+  private loadingSince = 0;
+  // lastSession keeps this browser's memory of the last opened session in
+  // step with the server's, so a phone opens what the desktop was looking
+  // at and the other way round.
+  private readonly lastSession: LastSessionMemory;
   private epoch = 0;
   // Files and Tasks dock into the same content row, so which one is open
   // is ONE value, not two booleans that could both be true.
@@ -276,6 +289,10 @@ export class LiveWorkspace {
     this.authMode = authMode;
     this.security = security;
     this.lastSessionStore = lastSessionStore;
+    this.lastSession = new LastSessionMemory(lastSessionStore, {
+      read: () => api.getLastSession(),
+      write: (id) => api.saveLastSession(id),
+    });
     // The phone boundary is a live condition, not a fact about any one
     // session: a rotation or a resized window crosses it whether the pane is
     // showing a terminal, a recovery presentation or nothing. The listener
@@ -366,6 +383,9 @@ export class LiveWorkspace {
       },
       onClose: () => this.root.querySelector<HTMLElement>("[data-live-more]")?.focus(),
     });
+    // The last served list is cached under the same storage as the last
+    // session, so a cold load draws the previous visit's rail dimmed
+    // instead of an empty one (comp Workspace Loading State, 1b).
     this.sidebarModel = new SidebarModel(api, {
       onCreateProject: () => {
         if (!this.disposed && this.selectedSessionID === null) this.renderEmptyPane();
@@ -373,7 +393,7 @@ export class LiveWorkspace {
       // Persist only at operator-gesture callbacks. selectSession also serves
       // startup and polling, which must not overwrite the preference.
       onSelectSession: (id, keyboard) => {
-        writeLastSession(this.lastSessionStore, id);
+        this.rememberSession(id);
         // A click hands the operator to the terminal; Enter on a focused
         // row keeps the keyboard in the sidebar so the next arrow still
         // moves the list.
@@ -387,7 +407,7 @@ export class LiveWorkspace {
       },
       onCreateSession: (id, codexLoginHelper) => {
         if (codexLoginHelper) this.codexLoginHelpers.add(id);
-        writeLastSession(this.lastSessionStore, id);
+        this.rememberSession(id);
         // Launching a session hands the operator to it: the picker is
         // closing, so focus belongs in the new terminal, not on the
         // button that launched it. The attach handshake still applies
@@ -429,7 +449,7 @@ export class LiveWorkspace {
       },
       onProvidersChanged: () => { if (!this.disposed) this.sidebar.renderNewSessionPicker(); },
       onError: (message, cause) => this.handleError(message, cause),
-    }, this.autoColorProjects);
+    }, this.autoColorProjects, lastSessionStore);
     this.sidebar = new Sidebar(region(root, "sidebar"), this.sidebarModel, undefined, () => this.openGitHubConnect(), {
       githubEnabled: this.authMode !== "none",
       onAuthorizationLost: () => this.requireAuthentication(),
@@ -498,6 +518,7 @@ export class LiveWorkspace {
       setItem: (key, value) => window.sessionStorage.setItem(key, value),
       removeItem: (key) => window.sessionStorage.removeItem(key),
     });
+    this.beginLoadingClock();
     this.renderEmptyPane();
   }
 
@@ -506,21 +527,32 @@ export class LiveWorkspace {
     this.started = true;
     this.tutorial.load();
     const lifecycle = this.lifecycle;
-    await this.sidebarModel.refresh();
-    if (this.disposed || lifecycle !== this.lifecycle) return;
+    // The rail paints before the first read answers: the cached list, or
+    // flat bands at row height, so the first thing on screen is a shell
+    // with the right shape rather than nothing.
     this.sidebar.render();
     this.mountOutputActivityEvents();
     this.loginCoordinator.start();
-    const initial = this.initialSessionID();
-    if (initial !== null) {
-      await this.selectSession(initial);
-    } else {
-      this.renderEmptyPane();
-    }
-    if (this.disposed || lifecycle !== this.lifecycle) return;
+    // The poll starts before the first read answers, not after: a first
+    // read that hangs would otherwise hold every retry the error pane
+    // promises. A later poll supersedes a read still in flight through the
+    // model's generation guard.
     this.sidebarTimer = window.setInterval(() => {
       void this.refreshSidebar();
     }, sidebarRefreshMS);
+    // The server's memory is asked for alongside the first read; every
+    // refresh then waits on that one answer before picking a session.
+    void this.lastSession.adopt();
+    await this.refreshSidebar();
+    if (this.disposed || lifecycle !== this.lifecycle) return;
+  }
+
+  // rememberSession records an operator's choice of session in both
+  // memories. The server write is best effort: a browser that cannot reach
+  // it still remembers locally, and the next successful read of the server
+  // is what the other device will see.
+  private rememberSession(id: string | null): void {
+    this.lastSession.remember(id);
   }
 
   dispose(): void {
@@ -552,11 +584,37 @@ export class LiveWorkspace {
       window.clearInterval(this.sidebarTimer);
       this.sidebarTimer = null;
     }
+    this.endLoadingClock();
     this.outputActivityEvents?.close();
     this.outputActivityEvents = null;
     this.clearOutputActivity();
     this.infoBar?.dispose();
     this.infoBar = null;
+  }
+
+  private beginLoadingClock(): void {
+    this.endLoadingClock();
+    this.loadingSince = Date.now();
+    for (const delay of [loadingSlowAfterMS, loadingFailedAfterMS]) {
+      this.loadingTimers.push(window.setTimeout(() => {
+        if (!this.disposed && this.selectedSessionID === null) this.renderEmptyPane();
+      }, delay));
+    }
+  }
+
+  private endLoadingClock(): void {
+    for (const timer of this.loadingTimers) window.clearTimeout(timer);
+    this.loadingTimers = [];
+  }
+
+  // loadingPhase reads the clock the loading pane speaks by. A read that
+  // has not answered in ten seconds is presented as failed — the operator
+  // gets the reassurance and the retry — even though the model is still
+  // waiting on it.
+  private loadingPhase(): LoadingPhase | "failed" {
+    const elapsed = Date.now() - this.loadingSince;
+    if (elapsed >= loadingFailedAfterMS) return "failed";
+    return elapsed >= loadingSlowAfterMS ? "slow" : "reconnect";
   }
 
   private repaintTutorial(): void {
@@ -578,15 +636,36 @@ export class LiveWorkspace {
     }
   }
 
+  // initialSessionID picks the row to reopen, from a served list only: a
+  // cached or stale list cannot vouch for a session, and selecting into
+  // one would fetch, fail, and clear the remembered selection.
   private initialSessionID(): string | null {
+    if (this.sidebarModel.listState !== "ready") return null;
     const sessions = this.sidebarModel.groups.flatMap((group) => group.sessions);
     return pickInitialSession(readLastSession(this.lastSessionStore), sessions);
+  }
+
+  // reattachingSessionName names the remembered selection as the cached
+  // list knows it, for the loading pane's first line.
+  private reattachingSessionName(): string | null {
+    const id = readLastSession(this.lastSessionStore);
+    if (id === null) return null;
+    const session = this.sidebarModel.groups.flatMap((group) => group.sessions).find((s) => s.id === id);
+    if (session === undefined) return null;
+    return session.display_name || providerDisplayName(session.provider);
   }
 
   private async refreshSidebar(): Promise<void> {
     if (this.disposed) return;
     const lifecycle = this.lifecycle;
     await this.sidebarModel.refresh();
+    if (this.disposed || lifecycle !== this.lifecycle) return;
+    if (this.sidebarModel.listState !== "loading") this.endLoadingClock();
+    // The server's remembered session is adopted before any automatic
+    // selection, on every refresh that could make one; the barrier is
+    // shared and bounded, so an overlapping poll waits on the same answer
+    // rather than opening this browser's old choice first.
+    await this.lastSession.adopt();
     if (this.disposed || lifecycle !== this.lifecycle) return;
     this.outputActivity.reconcile();
     this.sidebarModel.selectedSessionID = this.selectedSessionID;
@@ -678,7 +757,7 @@ export class LiveWorkspace {
     this.tutorial.resume();
     this.selectedSessionID = null;
     this.sidebarModel.selectedSessionID = null;
-    clearLastSession(this.lastSessionStore);
+    this.rememberSession(null);
     this.renderEmptyPane();
   }
 
@@ -1663,15 +1742,9 @@ export class LiveWorkspace {
     });
     const menu = popovers.querySelector<HTMLElement>("[data-more-popover]");
     if (menu === null) return;
-    this.positionMoreMenu(menu, rect);
-  }
-
-  private positionMoreMenu(menu: HTMLElement, rect: DOMRect): void {
     menu.style.top = `${rect.bottom + 6}px`;
     menu.style.left = `${Math.max(8, rect.right - menu.offsetWidth)}px`;
   }
-
-  private moreMenuRender: { html: string; node: HTMLElement } | null = null;
 
   // moreFocus is the control the More menu should focus once mounted, held
   // as intent rather than applied at the call site: the menu remounts on
@@ -1715,7 +1788,6 @@ export class LiveWorkspace {
     this.popoverOpen = null;
     this.themeFlyoutOpen = false;
     this.moreFocus = null;
-    this.moreMenuRender = null;
     // After auth teardown the root no longer carries workspace regions;
     // cleanup must be a no-op there, not a throw.
     this.root.querySelector('[data-region="popovers"]')?.replaceChildren();
@@ -1751,7 +1823,7 @@ export class LiveWorkspace {
     this.popoverOpen = "more";
     const trigger = this.root.querySelector<HTMLElement>("[data-live-more]");
     if (trigger === null) return;
-    const html = sessionMenuHtml({
+    this.anchorPopover(sessionMenuHtml({
       workspaceSecurity: this.security?.lock !== undefined,
       workspaceMethods: this.security?.manageMethods !== undefined,
       fontSize: terminalFontSize(),
@@ -1765,18 +1837,9 @@ export class LiveWorkspace {
       confirmingYolo: this.confirmingYolo,
       skipCloseConfirm: this.skipCloseConfirm,
       skipRemoveProjectConfirm: this.skipRemoveProjectConfirm,
-    });
-    const popovers = region(this.root, "popovers");
-    const current = popovers.querySelector<HTMLElement>("[data-more-popover]");
-    // Polling and unchanged settings must not detach a control mid-gesture.
-    // Another menu can take over the shared popover region.
-    const reuse = this.moreMenuRender?.html === html
-      && this.moreMenuRender.node.isConnected && current === this.moreMenuRender.node;
-    if (!reuse) this.anchorPopover(html, trigger.getBoundingClientRect());
-    const menu = popovers.querySelector<HTMLElement>("[data-more-popover]");
-    if (menu === null) { this.moreMenuRender = null; return; }
-    if (reuse) this.positionMoreMenu(menu, trigger.getBoundingClientRect());
-    else this.moreMenuRender = { html, node: menu };
+    }), trigger.getBoundingClientRect());
+    const menu = this.root.querySelector<HTMLElement>('[data-region="popovers"] [data-more-popover]');
+    if (menu === null) return;
     // Read fresh whenever the menu opens: the backend is the authority,
     // and a cached copy could show a mode the next launch does not use.
     if (this.skipPermissions === null || this.skipCloseConfirm === null || this.skipRemoveProjectConfirm === null) {
@@ -1787,11 +1850,6 @@ export class LiveWorkspace {
         this.setSkipRemoveProjectConfirm(s.skip_remove_project_confirm);
         this.openMore();
       }).catch((cause) => this.handleError("settings read failed", cause));
-    }
-    if (reuse) {
-      // Retain handlers and operator focus, including a pending action's
-      // disabled control; rewiring would duplicate the action.
-      return;
     }
     // Each toggle row is a button.menuitem whose whole surface is the hit
     // target; state is the label colour alone, so there is no inner switch
@@ -2140,17 +2198,19 @@ export class LiveWorkspace {
   }
 
   // emptyPane is the pane's one empty-state enum (comp desktop-r16), not
-  // a boolean: `off` while a session owns the pane, `no-session` when a
-  // project is in context with nothing open, `no-project` when a
-  // successful registry read found nothing, and `unread` until one
-  // succeeds — a failed read is not an empty database and never renders
-  // the no-project state. Deriving it from the selection and
-  // the sidebar's groups keeps the pane and the rail from disagreeing
-  // about what is in context.
+  // a boolean: `off` while a session owns the pane, `loading` until the
+  // first registry read answers, `error` while the latest read has
+  // failed, and only then `no-session` when a project is in context with
+  // nothing open or `no-project` when a successful read found nothing —
+  // a read that has not answered is not an empty database. Deriving it
+  // from the selection and the sidebar's groups keeps the pane and the
+  // rail from disagreeing about what is in context.
   private get emptyPane(): EmptyPane {
     if (this.selectedSessionID !== null) return "off";
-    if (this.sidebarModel.groups.length > 0) return "no-session";
-    return this.sidebarModel.registryReadOk ? "no-project" : "unread";
+    const list = this.sidebarModel.listState;
+    if (list === "loading") return this.loadingPhase() === "failed" ? "error" : "loading";
+    if (list === "error") return "error";
+    return this.sidebarModel.groups.length > 0 ? "no-session" : "no-project";
   }
 
   private handleError(_message: string, cause?: unknown): void {
@@ -2267,10 +2327,14 @@ export class LiveWorkspace {
       tasksPressed: this.panels.isOpen("tasks"),
       sessions: kind === "no-session",
     });
+    const phase = this.loadingPhase();
     region(this.root, "terminal").innerHTML = emptyPaneHtml({
       kind,
       projectName: project?.name ?? null,
       error: this.sidebarModel.error ?? "",
+      phase: phase === "failed" ? "slow" : phase,
+      session: this.reattachingSessionName(),
+      cached: this.sidebarModel.stale,
     });
     this.root.querySelector("[data-live-more]")?.addEventListener("click", () => this.showMore());
     this.root.querySelector("[data-live-panels]")?.addEventListener("click", () => this.showPanels());
@@ -2285,6 +2349,7 @@ export class LiveWorkspace {
       // The pane's action reaches the same dialogs the sidebar's own rows
       // open, so there is exactly one target for each gesture.
       if (kind === "no-project") this.sidebar.openNewProject();
+      else if (kind === "error") void this.refreshSidebar();
       else if (target !== null) this.sidebar.openNewSession(target.id);
     });
     if (target !== null) {

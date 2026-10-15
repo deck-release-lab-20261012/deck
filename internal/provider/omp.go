@@ -181,23 +181,56 @@ func (o *OmpDescriptor) NewDelegatedSessionArgs(spec LaunchSpec, delegated Deleg
 // and `--fork` branches: all are forbidden. An unknown id exits 1, which
 // is what makes a successful resume meaningful.
 //
-// The argv is intentionally bare: omp restores model, thinking, and
-// history from the resumed session's stored header, so replaying the
-// capture hook here would be wrong rather than merely redundant. Neither
-// this path nor an ordinary launch selects a model or reasoning level;
-// only a delegated launch does, because there the caller's choice is the
-// routing decision itself.
+// MEASURED against omp 18.10.3 (bun /usr/local/bin/omp; scratch cwd, scratch
+// tmux socket, and a fabricated throwaway conversation under the scratch
+// session dir; no prompts sent, zero API spend):
+//
+//	omp --resume <id> --hook <capture-hook>  -> session_start fires and
+//	  ctx.sessionManager.getSessionId() returns the RESUMED id
+//	omp --resume <id> (no --hook)            -> the resumed conversation's
+//	  stored header, the session dir, and ~/.omp/agent/config.yml contain
+//	  no reference to any hook: --hook is argv-only and never leaks into
+//	  stored session state
+//
+// So the capture hook rides along on resume exactly as on launch: it does
+// not rewrite what the resumed header restores, the resumed process
+// redelivers its id through the startup callback, and the capture channel
+// stays live in the resumed pane. Later in-pane switches are still
+// invisible until a session_switch capture exists — see below.
+//
+// The refusal path is real and stays honest: an in-pane /resume switches
+// omp's active conversation and discards the abandoned empty conversation
+// (MEASURED: the previous session's file no longer exists after the
+// switch), so the id recorded at launch can go stale. session_start does
+// not fire for an in-pane /resume at all — the switch emits only
+// session_before_switch/session_switch (MEASURED), and the pinned capture
+// hook subscribes to neither, so the switch is invisible to Deck even when
+// the hook is loaded. omp's extension API does offer session_switch, which
+// carries the new id through the hook context. The next auto-resume of the
+// dead id exits 1 ("Session not found"), which Deck records through
+// recordRefusedResume; the refusal never destroys the conversation.
+// Neither this path nor an ordinary launch selects a model or reasoning
+// level; only a delegated launch does, because there the caller's choice
+// is the routing decision itself.
 func (o *OmpDescriptor) ResumeSessionArgs(spec ResumeSpec) ([]string, error) {
 	id := strings.TrimSpace(spec.NativeSessionID)
 	if id == "" {
 		return nil, fmt.Errorf("provider: omp resume requires a native session id")
 	}
-	argv := []string{o.execPath, "--resume", id}
+	argv := []string{o.execPath, "--resume", id, "--hook", o.hookPath}
 	if spec.SkipPermissions {
 		argv = append(argv, "--auto-approve")
 	}
 	return argv, nil
 }
+
+// ResumeCaptureHookSource: MEASURED against omp 18.10.3 — the session_start
+// callback a resumed process fires posts the same startup-shaped source a
+// fresh launch posts, carrying the RESUMED id. The resume flight therefore
+// takes a startup-shaped capture grant, never a resume-shaped one: the
+// pinned hook emits no resume source, and inventing one would attest a
+// distinction the provider does not make.
+func (o *OmpDescriptor) ResumeCaptureHookSource() string { return "startup" }
 
 func (o *OmpDescriptor) Environment() []string {
 	return []string{

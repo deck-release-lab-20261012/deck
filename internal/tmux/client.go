@@ -1314,7 +1314,7 @@ func (c *Client) paneInfo(ctx context.Context, tgt string) (*PaneInfo, error) {
 		info.ExitStatus = &status
 	}
 	if parts[6] != "" {
-		signal, err := strconv.Atoi(parts[6])
+		signal, err := parsePaneSignal(parts[6])
 		if err != nil {
 			return nil, fmt.Errorf("tmux: unparseable pane_dead_signal %q: %w", parts[6], err)
 		}

@@ -24,6 +24,7 @@ from probe_a2a_receive import HOOKS, INVITE_BODY, MAILBOX  # noqa: E402
 DRIVE = """
 import { A2AChat } from '__PLUGIN__';
 const root = '__ROOT__';
+const BODY = __BODY__;
 const calls = [];
 const state = { admitted: [] };
 const client = {
@@ -52,9 +53,17 @@ const events = [
 for (const e of events) {
   await plugin.event({ event: e });
 }
+// First the wake path — the follower hands the plugin events directly:
+// this is exactly what one stdout line of `a2a inbox --follow --json`
+// delivers, with no peek in between.
+const wake = [
+  { id: 'w1', type: 'chat.invite', from_agent: 'fixture', correlation_id: 'chat-fixture',
+    scope: 'chat-fixture|invite', body: BODY },
+];
+await plugin.deliverEvents(wake);
+append('wake-submitted=' + JSON.stringify(calls));
 for (let i = 0; i < 100 && !state.admitted.length; i++) {
   await new Promise((resolve) => setTimeout(resolve, 100));
-  await plugin.poll();
 }
 append('prompts=' + JSON.stringify(calls));
 append('parts=' + JSON.stringify(state.admitted.flatMap((m) => m.parts.map((p) => p.text))));
@@ -63,7 +72,8 @@ append('strip=' + (process.env.PROBE_STRIP_TEXT === '1'));
 
 
 def drive_once(root: Path, strip: bool = False) -> str:
-    drive = DRIVE.replace("__PLUGIN__", str(HOOKS / "a2a-opencode-hook.js")).replace("__ROOT__", str(root))
+    drive = (DRIVE.replace("__PLUGIN__", str(HOOKS / "a2a-opencode-hook.js"))
+             .replace("__ROOT__", str(root)).replace("__BODY__", json.dumps(INVITE_BODY)))
     env = {key: value for key, value in os.environ.items() if key in ("PATH",)}
     env.update(
         HOME=str(root),
@@ -71,6 +81,9 @@ def drive_once(root: Path, strip: bool = False) -> str:
         A2A_STATE_DIR=str(root / "state"),
         NOISEDECK_MEMPALACE_PYTHON="/usr/bin/python3",
         A2A_OPENCODE_POLL_MS="100",
+        # The drive exercises the wake and peek paths directly; a real
+        # follower child would outlive the scripted drive.
+        A2A_OPENCODE_FOLLOW="0",
     )
     if strip:
         env["PROBE_STRIP_TEXT"] = "1"

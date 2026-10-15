@@ -176,6 +176,8 @@ function makeHarness(notified?: () => void): Harness {
     selectedSessionID: null,
     error: null,
     registryReadOk: true,
+    listState: "ready",
+    stale: false,
     gitIdentities: null,
     creatingSession: false,
     api: {
@@ -239,6 +241,31 @@ test("a render whose markup matches the last paint leaves the container alone", 
     sidebar.render();
     assert.equal(container.writes, 1,
       "a render that rebuilds the identical string rewrote the container — the skip is not firing");
+  });
+});
+
+test("a stale list paints dimmed and inert, and an unanswered one paints bands", () => {
+  withEnv(({ sidebar, container }) => {
+    const model = (sidebar as unknown as { model: { stale: boolean; listState: string; registryReadOk: boolean; groups: unknown[] } }).model;
+    assert.ok(!container.html.includes("data-list-stale"), "a served list is live");
+    model.stale = true;
+    model.listState = "error";
+    sidebar.render();
+    assert.match(container.html, /data-list-stale aria-busy="true"/, "stale rows are marked busy");
+    assert.match(container.html, /data-list-stale aria-busy="true" inert /, "and inert: no row control is focusable or reachable");
+    assert.match(container.html, /pointer-events-none opacity-55/, "and drawn dimmed");
+    assert.match(container.html, /data-list-syncing/, "the header says the rail is syncing");
+    assert.ok(!container.html.includes("data-projects-menu"), "and offers no menu over it");
+    assert.match(container.html, /data-sheet-new-session disabled/, "the sheet's New session is disabled over a stale list");
+    assert.match(container.html, /alpha/, "the last served rows are still drawn");
+    model.stale = false;
+    model.listState = "loading";
+    model.registryReadOk = false;
+    model.groups.length = 0;
+    sidebar.render();
+    assert.match(container.html, /data-loading-band/, "no rows and no answer draws bands");
+    assert.ok(!container.html.includes("data-new-project-row"), "never a create affordance before an answer");
+    assert.ok(!container.html.includes("data-projects-menu"), "and no menu over an unread list");
   });
 });
 

@@ -26,7 +26,10 @@ request, not after.
 The daily job's workflows run only in the private repository and are not part
 of the source release.
 
-1. **A scheduled workflow moves the pins.** Once a day `harness-bump.yaml`
+1. **A scheduled workflow moves the pins.** Twice a day (amended
+   2026-10-15: the fastest upstream ships more than twice a day, the run
+   averages under fifteen minutes, and a failed run previously cost a full
+   day of staleness) `harness-bump.yaml`
    compares every pin in the harness catalogue with what its upstream
    publishes and, for each eligible harness that has moved, rewrites the pin and
    every literal that repeats it. The catalogue and the rewrite live in
@@ -37,8 +40,12 @@ of the source release.
    reads every catalogue upstream once and fails on unavailable sources.
    The job applies every eligible outdated pin and its repeated literals, runs pin
    tests, builds the runtime image once, then runs the contract probe for
-   every updated CLI. One failed probe prevents the entire batch from
-   opening a PR. Per the operator's 2026-09-05 amendment, daily probes
+   every updated CLI. A harness whose probe fails is returned to its
+   pre-batch pin and named in the report, and the rest of the batch ships;
+   the next run discovers it outdated and tries again (amended 2026-10-15:
+   one broken release must not hold every other harness's update hostage).
+   A batch in which every updated harness failed its probe opens no PR and
+   fails the run. Per the operator's 2026-09-05 amendment, daily probes
    validate installation and credential-free startup/syntax only: no harness
    account login, API key, authenticated prompt, or exact historically
    measured version is required. Probes have no network and use disposable
@@ -72,9 +79,11 @@ of the source release.
    or asserted by a version bump. An orphan is admitted
    only after trusted code reconstructs the complete candidate tree at its
    merge base. A modified orphan or Git error fails visibly.
-   The job uploads exact-tip evidence with a `3\\n` producer marker only
-   after every updated CLI probe passes; earlier per-harness markers
-   cannot attest to a batch. Publication follows upload and a tip recheck.
+   The job uploads exact-tip evidence with a `4\\n` producer marker only
+   after every updated CLI that remains in the batch passes its contract
+   probe and its native a2a receive probe; earlier per-harness markers
+   cannot attest to a batch, and a dropped harness leaves the branch, the
+   report and the pull request before the marker is written. Publication follows upload and a tip recheck.
    Settlement is awakened by completion of the producer and Fast checks,
    with an hourly retry. It deliberately has no pull-request-review trigger:
    those events use PR refs, which the main-only runner cannot admit, and

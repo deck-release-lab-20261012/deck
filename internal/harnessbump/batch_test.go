@@ -183,6 +183,107 @@ func TestBatchSettlementNeedsEvidenceGreenCIAndExactApproval(t *testing.T) {
 	}
 }
 
+func TestDropReturnsOneHarnessToItsPreBatchPin(t *testing.T) {
+	root, resolver := batchFixture(t)
+	result, err := ApplyBatch(context.Background(), root, resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fullID := result.ID
+	if err := Drop(root, &result, "omp", "contract probe failed"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pins := ReadPins(raw)
+	if pins["OMP_VERSION"] != "18.1.2" || pins["CRUSH_VERSION"] != "0.93.0" {
+		t.Fatalf("drop did not restore the pre-batch pin: %v", pins)
+	}
+	deployTest, err := os.ReadFile(filepath.Join(root, "deploy", "omp_cli_package_test.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(deployTest), "ARG OMP_VERSION=18.1.2") {
+		t.Fatalf("drop left the deploy test on the failed version: %s", deployTest)
+	}
+	readme, err := os.ReadFile(filepath.Join(root, "docs", "provider-contracts", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(readme), "| omp | 18.1.2 |") || !strings.Contains(string(readme), "Crush 0.93.0") {
+		t.Fatalf("drop left the README inconsistent: %s", readme)
+	}
+	if len(result.Updated) != 1 || result.Updated[0] != "crush" {
+		t.Fatalf("updated = %v", result.Updated)
+	}
+	if len(result.Dropped) != 1 || result.Dropped[0].Harness != "omp" || result.Dropped[0].Version != "18.1.2" || result.Dropped[0].Reason != "contract probe failed" {
+		t.Fatalf("dropped = %+v", result.Dropped)
+	}
+	if _, ok := result.Revert["omp"]; ok {
+		t.Fatal("a dropped harness keeps no revert")
+	}
+	wantID, err := BatchID(ReadPins(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ID != wantID || result.ID == fullID {
+		t.Fatalf("id = %s, want %s (full was %s)", result.ID, wantID, fullID)
+	}
+	// The next discovery sees the dropped harness as outdated again and
+	// rebuilds the full batch: a kept-back harness is retried, never lost.
+	again, err := ApplyBatch(context.Background(), root, resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ID != fullID || len(again.Updated) != 1 || again.Updated[0] != "omp" {
+		t.Fatalf("rediscovery after a drop = %+v", again)
+	}
+	if err := Drop(root, &result, "omp", "again"); err == nil {
+		t.Fatal("a harness absent from the batch dropped")
+	}
+}
+
+// A reduced batch is the job's own work: reconstruction moves only the
+// surviving harness from the merge base and the trees compare equal.
+func TestReducedBatchReconstructsWithRealGit(t *testing.T) {
+	root, resolver := batchFixture(t)
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Fixture", "GIT_COMMITTER_NAME=Fixture", "GIT_AUTHOR_EMAIL=fixture@example.invalid", "GIT_COMMITTER_EMAIL=fixture@example.invalid")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git("init", "-b", "main")
+	git("add", ".")
+	git("commit", "-m", "base")
+	git("remote", "add", "origin", root)
+	git("checkout", "-b", "batch")
+	result, err := ApplyBatch(context.Background(), root, resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Drop(root, &result, "crush", "contract probe failed"); err != nil {
+		t.Fatal(err)
+	}
+	git("add", ".")
+	git("commit", "-m", "batch")
+	head := git("rev-parse", "HEAD")
+	git("checkout", "main")
+	prove := Reconstruct(root, resolver)
+	if ok, err := prove(context.Background(), Harness{Name: "all"}, result.ID, head); err != nil || !ok {
+		t.Fatalf("reduced batch rejected: %v, %v", ok, err)
+	}
+	if ok, err := prove(context.Background(), Harness{Name: "all"}, strings.Repeat("b", 64), head); err != nil || ok {
+		t.Fatalf("wrong identity admitted: %v, %v", ok, err)
+	}
+}
+
 func TestBatchEvidenceRejectsPerHarnessMarker(t *testing.T) {
 	for _, marker := range []string{"", "2\n", "3\n", "4\n"} {
 		tip, err := gatedTipFromZipVersion(evidenceZIP(t, evidenceTestHead, marker), allProbeGateVersion)

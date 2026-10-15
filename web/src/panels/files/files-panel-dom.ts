@@ -18,6 +18,7 @@ import * as hints from "../../lib/hints.ts";
 import { uploadDetailsHtml, uploadInfo, uploadRing } from "./files-upload-view.ts";
 import {
   fileExtension,
+  rowChange,
   rowMeta,
   rowName,
   splitFileName,
@@ -472,12 +473,14 @@ export class FilesPanel {
     const m = this.model;
     const selected = m.selected?.path === entry.path;
     const meta = rowMeta(entry, m.sort.field, Date.now());
+    const change = rowChange(entry);
     return `
       <div role="button" tabindex="0" data-files-row="${escapeHtml(entry.path)}" data-focus-key="row:${escapeHtml(entry.path)}"
         aria-current="${selected ? "true" : "false"}" data-hint="${entry.dir ? hints.OPEN_THIS_FOLDER : hints.OPEN_THIS_FILE}"
         class="flex w-full flex-none cursor-pointer items-center gap-[9px] rounded-control border-0 px-2 py-1.5 text-left transition-colors max-md:min-h-11 ${selected ? "bg-wash-selected" : "bg-transparent"} hover:bg-wash-hover focus-visible:bg-wash-hover">
         <span aria-hidden="true" class="flex-none ${entry.dir ? "text-text-secondary" : "text-text-tertiary"}">${lucideIcon(entry.dir ? "folder" : "file-text", 14)}</span>
         <span class="min-w-0 flex-1 truncate text-body-sm font-medium ${entry.dir || selected ? "text-text-primary" : "text-text-secondary"}">${escapeHtml(rowName(entry))}</span>
+        ${change === "" ? "" : `<span data-files-change="${change === "New" ? "new" : "modified"}" class="flex-none text-caption text-text-tertiary">${change}</span>`}
         ${meta === "" ? "" : `<span class="flex-none text-caption text-text-tertiary">${escapeHtml(meta)}</span>`}
       </div>
     `;

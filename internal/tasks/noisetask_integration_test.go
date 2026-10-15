@@ -314,6 +314,7 @@ func TestNoisetaskStoreRoundTrip(t *testing.T) {
 // operator. An invalid provider selects the local refusal before any
 // provider call.
 func TestNoisetaskGenerateContract(t *testing.T) {
+	requireGenerationSupport(t)
 	binaries := buildTaskBinaries(t)
 	t.Setenv("NOISE_TASKS_PROVIDER", "invalid")
 	e := newJobEnv(t, binaries.noise)

@@ -28,7 +28,7 @@ from pathlib import Path
 INVITE_BODY = "Synthetic native receive check"
 HOOKS = Path(__file__).resolve().parent / "hooks"
 MAILBOX = r'''
-import json, pathlib, sys
+import json, pathlib, sys, time
 p = pathlib.Path(__file__).parent
 def calls():
     with (p / "calls").open("a") as f:
@@ -44,8 +44,30 @@ calls()
 if DELAY and argv[:1] in (["inbox"], ["mark-read"]):
     # Model a relay whose rooms have grown: the mailbox read is slow, past
     # the extension's old five-second budget, and delivery must still happen.
-    import time as _time
-    _time.sleep(DELAY)
+    time.sleep(DELAY)
+if argv[:1] == ["inbox"] and "--follow" in argv:
+    # The follower: an initial line of unread mail, then hold the stream
+    # open the way the relay's wait would — the harness kills it at
+    # shutdown. The probe asserts the pid stayed alive and a second wake
+    # was emitted, so a stub that dies after its first line fails the
+    # probe instead of hiding behind fallback delivery.
+    (p / "follow-pid").write_text(str(__import__("os").getpid()))
+    if DELAY:
+        time.sleep(DELAY)
+    sys.stdout.write(json.dumps([] if (p / "acked").exists() else [invite()]) + "\n")
+    sys.stdout.flush()
+    # The receipt that acknowledges the invitation is itself a room event,
+    # so the relay wakes the stream again: emit a second, empty wake as
+    # soon as the acknowledgement lands, proving the stream survived its
+    # first line instead of crashing behind a successful delivery.
+    for _ in range(1200):
+        if (p / "acked").exists():
+            sys.stdout.write("[]\n")
+            sys.stdout.flush()
+            (p / "woke2").write_text("yes")
+            break
+        time.sleep(0.05)
+    time.sleep(3600)
 if argv[:1] == ["inbox"]:
     print("[]" if (p / "acked").exists() else json.dumps([invite()]))
 elif argv[:1] == ["mark-read"]:
@@ -195,6 +217,20 @@ class Probe:
         if not predicate():
             raise AssertionError(f"{what} (harness={self.harness})")
 
+    def follower_woke_twice(self) -> bool:
+        return (self.root / "woke2").exists()
+
+    def assert_follower_alive(self) -> None:
+        # Delivery with the interval disabled proves the follower delivered;
+        # a second wake written after the acknowledgement proves the same
+        # child survived its first line instead of crashing behind a
+        # successful delivery. Whether the pid is still alive afterwards is
+        # not observable here: a harness that ends its own session must take
+        # the follower with it, and one that keeps running must not, so pid
+        # liveness can race either way by design.
+        if not (self.root / "follow-pid").exists() or not (self.root / "woke2").exists():
+            self.fail("the follower never reached its second wake")
+
     def cleanup(self) -> None:
         if not self.keep:
             subprocess.run(["rm", "-rf", str(self.root)], check=False)
@@ -239,7 +275,7 @@ def probe_pi_family(probe: Probe, binary: str) -> None:
     )
     env = probe.env({
         "PI_CODING_AGENT_DIR": str(probe.root / "agent"),
-        "A2A_PI_POLL_MS": "100",
+        "A2A_PI_POLL_MS": "3600000",
         "NOISEDECK_MEMPALACE_HARNESS": "omp" if binary == "omp" else "pi",
     })
     argv = [binary, "--model", "probe/probe", "--mode", "rpc", *flags,
@@ -247,8 +283,10 @@ def probe_pi_family(probe: Probe, binary: str) -> None:
     probe.spawn(argv, env)
     budget = 90 if probe.mail_delay_s else 25
     try:
-        probe.wait_for(lambda: probe.mark("started") and probe.mark("acked"), budget,
-                       "the extension never delivered the invitation as a user prompt")
+        probe.wait_for(
+            lambda: probe.mark("started") and probe.mark("acked") and probe.follower_woke_twice(),
+            budget, "the extension never delivered the invitation as a user prompt")
+        probe.assert_follower_alive()
     finally:
         probe.stop()
     if "session_start" not in probe.events():
@@ -298,7 +336,7 @@ def probe_opencode(probe: Probe) -> None:
     )
     port = free_port()
     env = probe.env({
-        "A2A_OPENCODE_POLL_MS": "100",
+        "A2A_OPENCODE_POLL_MS": "3600000",
     })
     argv = ["opencode", "serve", "--port", str(port), "--hostname", "127.0.0.1", "--print-logs"]
     probe.spawn(argv, env)
@@ -316,8 +354,9 @@ def probe_opencode(probe: Probe) -> None:
                                          data=json.dumps({}).encode(),
                                          headers={"Content-Type": "application/json"})
         urllib.request.urlopen(request, timeout=10).read()
-        probe.wait_for(lambda: probe.mark("acked"), 45,
+        probe.wait_for(lambda: probe.mark("acked") and probe.follower_woke_twice(), 45,
                        "the plugin never delivered the invitation as a session prompt" + probe.tail("calls"))
+        probe.assert_follower_alive()
         probe.wait_for(lambda: _model_saw(model, INVITE_BODY), 30,
                        "the loopback model never saw the delivered invitation" + probe.tail("calls"))
     finally:

@@ -123,6 +123,9 @@ type FileEntry struct {
 	Size  int64  `json:"size,omitempty"`
 	Mode  string `json:"mode"`
 	MTime string `json:"mtime"`
+	// Change is "modified" or "new" when git status says the entry differs
+	// from the last commit; for a directory, when something inside it does.
+	Change string `json:"change,omitempty"`
 }
 
 // FileListing is one directory inside a project.

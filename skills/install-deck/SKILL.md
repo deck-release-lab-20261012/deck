@@ -1,6 +1,6 @@
 ---
 name: install-deck
-description: Install or upgrade Noisefloor Deck, the browser console for running coding agents, from a tagged public release with Docker Compose. Use when the user asks to install, update or reinstall Deck.
+description: Install or upgrade Noisefloor Deck from a tagged public release with Docker Compose, or follow its native macOS source-install procedure when explicitly requested. Use when the user asks to install, update or reinstall Deck.
 ---
 
 # Install Noisefloor Deck
@@ -12,6 +12,13 @@ containers in Docker's VM, not Deck natively. The default source is
 trusted public GitHub repository, for example a fork they operate.
 The agent runs checks and the build; the human owns privileged decisions
 and reads the one-time bootstrap password.
+
+If the human explicitly wants Deck and its providers to run **natively on
+macOS**, read [Native macOS](references/native-macos.md) and follow that
+procedure instead of the Docker-specific host, discovery and lifecycle
+sections below. Preserve the common Source repository and Origin checks.
+Docker on a Mac still runs Linux and must never be reported as native macOS.
+Do not choose or migrate between these installation types implicitly.
 
 ## Source repository
 
@@ -115,9 +122,11 @@ Require these host checks:
 - Widen the loopback bind, set `NOISEDECK_PUBLIC_ORIGIN`, change
   `NOISEDECK_AUTH_MODE`, runtime UID/GID, host identity or volume bindings
   of an existing installation.
-- Make network calls beyond the agreed `PUBLIC_REPO` public repository/release endpoints,
-  image-build downloads and loopback status probe; bypass a failed check;
-  or fall back to another tag, commit or artifact.
+- For Docker installs, make network calls beyond the agreed `PUBLIC_REPO`
+  public repository/release endpoints, image-build downloads and loopback
+  status probe. Native installs additionally permit only the dependency
+  downloads named in the native reference. Never bypass a failed check or
+  fall back to another tag, commit or artifact.
 
 ## Discover and select
 

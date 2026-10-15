@@ -3,7 +3,6 @@ package project
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -143,6 +142,9 @@ func TestCancelKeepsThePartialCloneAndResumeStartsAgain(t *testing.T) {
 	}
 	waitForPartial(t, filepath.Join(root, "deck", ".git", "pack.tmp"))
 	helper := readHelperPID(t, filepath.Join(root, "deck", ".git", "helper.pid"))
+	if !processAlive(t, helper) {
+		t.Fatal("git helper was not alive before cancellation")
+	}
 	started := time.Now()
 	stopped, err := c.Cancel(job.ID)
 	if err != nil {
@@ -156,7 +158,7 @@ func TestCancelKeepsThePartialCloneAndResumeStartsAgain(t *testing.T) {
 	if time.Since(started) > time.Second {
 		t.Fatalf("cancel took %s: it waited on a pipe instead of killing the group", time.Since(started))
 	}
-	if processAlive(helper) {
+	if processAlive(t, helper) {
 		t.Fatalf("git's helper (pid %d) survived the cancel", helper)
 	}
 	if _, err := os.Stat(filepath.Join(root, "deck", ".git", "pack.tmp")); err != nil {
@@ -555,14 +557,15 @@ func readHelperPID(t *testing.T, path string) int {
 
 // processAlive reports whether pid still exists; a killed helper may linger
 // as a zombie for a moment, so a live process is one that is not a zombie.
-func processAlive(pid int) bool {
+func processAlive(t *testing.T, pid int) bool {
+	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+		alive, err := cloneHelperRunning(pid)
 		if err != nil {
-			return false
+			t.Fatalf("observe git helper process: %v", err)
 		}
-		if strings.Contains(string(status), "State:\tZ") {
+		if !alive {
 			return false
 		}
 		time.Sleep(20 * time.Millisecond)

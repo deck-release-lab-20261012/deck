@@ -217,8 +217,66 @@ try {
   await page.locator("[data-project-source-dialog]").waitFor();
   assert.ok(true, "the pane's Add project opens the same source chooser the Projects menu opens");
 
-  assert.deepEqual(pageErrors, [], "no uncaught page errors across both states");
-  console.log("empty pane: both states render the r16 anatomy on the surface, in the interface voice, with working actions: PASS");
+  // ---- loading (comp Workspace Loading State) -----------------------------
+  // Until the first read answers, nothing on the page may read as an empty
+  // database: the pane is a spinner and a line, the rail is flat bands at
+  // the real row height, and no create affordance exists anywhere.
+  await openState("empty=loading");
+  await page.locator('[data-empty-pane="loading"]').waitFor();
+  assert.equal(await page.locator("[data-empty-title]").count(), 0,
+    "the loading pane has no title: nothing has been found out yet");
+  assert.equal(await page.locator("[data-empty-action]").count(), 0,
+    "and no action");
+  assert.equal(await page.locator("[data-empty-line]").textContent(), "Reconnecting to your sessions…");
+  for (const text of ["No projects yet", "No session open", "Projects unavailable"]) {
+    assert.equal(await page.getByText(text, { exact: true }).count(), 0,
+      `"${text}" never shows before the server has answered`);
+  }
+  assert.equal(await page.locator("[data-new-project-row]").count(), 0,
+    "no Add project row before a read succeeds");
+  assert.equal(await page.locator("[data-projects-menu]").count(), 0,
+    "no Projects menu over a list nobody has read");
+  const bands = page.locator('[data-region="sidebar"] [data-loading-band]');
+  assert.equal(await bands.count(), 4, "four flat project bands hold the rail's shape");
+  const bandMetrics = await bands.first().evaluate((el) => {
+    const row = el.querySelector("div");
+    const styles = getComputedStyle(row);
+    return {
+      height: row.getBoundingClientRect().height,
+      animation: styles.animationName,
+      listBusy: el.closest("[data-project-list]")?.getAttribute("aria-busy") ?? null,
+    };
+  });
+  assert.equal(bandMetrics.height, 31, `a band is one real row tall (${bandMetrics.height}px)`);
+  assert.equal(bandMetrics.animation, "none", "bands are flat — no shimmer, no pulse");
+  assert.equal(bandMetrics.listBusy, "true", "the unanswered list says it is busy");
+  const spinnerFont = await page.locator("[data-empty-line]").evaluate((el) => getComputedStyle(el).fontFamily);
+  await assertFontVoice(page, spinnerFont, "ui", `the loading line is the interface voice (${spinnerFont})`);
+  const loadingSurface = await surface();
+  assert.equal(loadingSurface.pane, loadingSurface.chrome,
+    "the loading pane sits on the page surface like the settled states");
+
+  // ---- error ---------------------------------------------------------------
+  // A failed read is its own state: the reassurance leads, the server's
+  // message trails, the one action retries, and nothing offers to create.
+  await openState("empty=error");
+  await page.locator('[data-empty-pane="error"]').waitFor();
+  assert.equal(await page.locator("[data-empty-title]").textContent(), "Can't reach the runtime");
+  assert.ok((await page.locator("[data-empty-body]").textContent()).includes("Your sessions are still on the server."),
+    "the body reassures before it explains");
+  assert.equal(await page.locator("[data-empty-detail]").textContent(), "project registry unavailable",
+    "the server's own message trails as a caption");
+  assert.equal(await page.locator("[data-empty-action]").textContent(), "Retry now");
+  assert.equal(await page.locator("[data-new-project-row]").count(), 0,
+    "a failed read never offers onboarding");
+  const errorType = await paneTypography();
+  assert.equal(errorType.caps, "all-small-caps", "the error state shares the settled anatomy");
+  const errorLift = await opticalLift();
+  assert.ok(errorLift.lift > errorLift.paneHeight * 0.01 && errorLift.lift < errorLift.paneHeight * 0.12,
+    `the error composition is lifted like its siblings (${errorLift.lift}px in ${errorLift.paneHeight}px)`);
+
+  assert.deepEqual(pageErrors, [], "no uncaught page errors across the four states");
+  console.log("empty pane: the settled states render the r16 anatomy, the loading state never reads as empty, and the error state retries: PASS");
   await context.close();
 } finally {
   await browser?.close();

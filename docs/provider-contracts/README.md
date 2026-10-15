@@ -77,16 +77,16 @@ assumption no measurement supports.
 | devin | 3000.11.3 | 3000.6.14 | ✅ measured 2026-09-06 | ✅ measured 2026-09-06 — modal input unmeasured | ⚠️ carried forward (measured on 3000.5.20) — escapes |
 | kimi | 2.1.1 | 0.29.2 | ⚠️ carried forward | ⬜ unmeasured | ⚠️ carried forward |
 | opencode | 1.19.0 | 1.18.4 | ⚠️ carried forward | ⚠️ carried forward | ⚠️ carried forward |
-| pi | 1.1.0 | 0.84.1 | ⚠️ carried forward | ⚠️ carried forward | ⚠️ carried forward — escapes |
-| command-code | 1.79.2 | 1.21.0 | ⚠️ carried-forward documented hook; exact resume unmeasured | ⬜ unmeasured | ⬜ unmeasured |
-| cline | 3.0.70 | 3.0.53 | not applicable — fresh relaunch only | ⬜ unmeasured | ⬜ unmeasured |
+| pi | 1.2.0 | 0.84.1 | ⚠️ carried forward | ⚠️ carried forward | ⚠️ carried forward — escapes |
+| command-code | 1.81.0 | 1.21.0 | ⚠️ carried-forward documented hook; exact resume unmeasured | ⬜ unmeasured | ⬜ unmeasured |
+| cline | 3.0.71 | 3.0.53 | not applicable — fresh relaunch only | ⬜ unmeasured | ⬜ unmeasured |
 | kilo | 7.8.8 | 7.4.21 | ⚠️ carried forward | ⚠️ carried forward | ⬜ unmeasured |
-| omp | 18.10.1 | 17.2.12 | ⚠️ carried forward | ⬜ unmeasured | ⬜ unmeasured |
+| omp | 18.10.3 | 17.2.12 | ⚠️ carried forward | ⬜ unmeasured | ⬜ unmeasured |
 | qwen | 0.25.1 | 0.21.14 | not applicable — fresh relaunch only | ⬜ unmeasured | ⬜ unmeasured |
 | mimo | 0.1.15 | 0.1.13 | not applicable — fresh relaunch only | ⬜ unmeasured | ⬜ unmeasured |
-| qoder | 1.1.68 | 1.1.28 | not applicable — fresh relaunch only | ⬜ unmeasured | ⬜ unmeasured |
+| qoder | 1.1.70 | 1.1.28 | not applicable — fresh relaunch only | ⬜ unmeasured | ⬜ unmeasured |
 | cursor | 2026.10.01-e373342 | 2026.08.11-e8db854 | not applicable — fresh relaunch only | ⬜ unmeasured | ⬜ unmeasured |
-| grok | 1.0.50 | 1.0.5 | not applicable — fresh relaunch only | ⬜ unmeasured | ⬜ unmeasured |
+| grok | 1.0.52 | 1.0.5 | not applicable — fresh relaunch only | ⬜ unmeasured | ⬜ unmeasured |
 
 The image also ships Crush 0.98.1 as an operator-invoked CLI. Crush has no Deck
 provider descriptor in this revision and is excluded from the behavioral table.

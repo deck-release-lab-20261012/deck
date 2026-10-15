@@ -376,12 +376,12 @@ func TestProbeReadsBothContractShapesAndFailsClosed(t *testing.T) {
 	good := func(_ context.Context, args []string, stdin string) (string, error) {
 		calls++
 		if strings.Join(args, " ") == "resume --help" {
-			return "Usage: codex resume [OPTIONS] [SESSION_ID]\n  --no-daemon\n  --dangerously-bypass-approvals-and-sandbox  yes\n", nil
+			return "Usage: codex resume [OPTIONS] [SESSION_ID]\n  --no-daemon\n  --no-alt-screen\n  --dangerously-bypass-approvals-and-sandbox  yes\n", nil
 		}
-		return "  -a, --ask-for-approval\n  --no-daemon\n  --dangerously-bypass-approvals-and-sandbox\n", nil
+		return "  -a, --ask-for-approval\n  --no-daemon\n  --no-alt-screen\n  --dangerously-bypass-approvals-and-sandbox\n", nil
 	}
 	report, err := Probe(context.Background(), spec, "0.162.1", good)
-	if err != nil || calls != 2 || len(report) != 5 {
+	if err != nil || calls != 2 || len(report) != 7 {
 		t.Fatalf("report = %v, err %v, calls %d", report, err, calls)
 	}
 	prefix := func(out string) Runner {
@@ -587,10 +587,15 @@ func TestDockerRunnerArgv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"--network", "none"`, `"--read-only"`, `"--tmpfs", "/tmp:rw,mode=1777"`, `"HOME=/tmp"`, `"XDG_CONFIG_HOME=/tmp/config"`, `"XDG_DATA_HOME=/tmp/data"`, `"XDG_STATE_HOME=/tmp/state"`, `"XDG_CACHE_HOME=/tmp/cache"`, `"--rm"`} {
+	for _, want := range []string{`"--network", "none"`, `"--read-only"`, `"--tmpfs", tmpfsHome`, `"HOME=/tmp"`, `"XDG_CONFIG_HOME=/tmp/config"`, `"XDG_DATA_HOME=/tmp/data"`, `"XDG_STATE_HOME=/tmp/state"`, `"XDG_CACHE_HOME=/tmp/cache"`, `"--rm"`} {
 		if !regexp.MustCompile(regexp.QuoteMeta(want)).Match(src) {
 			t.Errorf("DockerRunner lacks %s", want)
 		}
+	}
+	// Without the explicit exec token moby mounts the probe's /tmp noexec
+	// and every hook-based receive probe fails with "Permission denied".
+	if !strings.Contains(string(src), `"/tmp:rw,exec,mode=1777"`) {
+		t.Error("tmpfsHome lost its exec token; hook-based receive probes cannot run their wrapper")
 	}
 }
 

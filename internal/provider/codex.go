@@ -179,8 +179,16 @@ func (c *CodexDescriptor) NewSessionArgs(spec LaunchSpec) ([]string, error) {
 
 // sessionArgs keeps each pane's hook environment in its own native server.
 // Reusing Codex's daemon retains the first pane's callback token in later tabs.
+//
+// --no-alt-screen runs the TUI inline: transcript lines land in the normal
+// screen buffer, so they scroll into tmux pane history, where Deck's
+// scrollback and copy live. In the alternate screen nothing codex prints
+// ever reaches the history, so output that scrolled off the visible screen
+// cannot be reached or copied from the browser at all. The cost is inline
+// rendering: full-screen redraws scroll through history as painted frames
+// instead of staying on one clean screen. Verified against 0.162.1.
 func (c *CodexDescriptor) sessionArgs(skipPermissions bool) []string {
-	argv := []string{c.execPath, "--no-daemon"}
+	argv := []string{c.execPath, "--no-daemon", "--no-alt-screen"}
 	if skipPermissions {
 		// Verified against codex-cli 0.145.0. This flag drops BOTH the
 		// approval prompts and codex's own sandbox — the two are one flag

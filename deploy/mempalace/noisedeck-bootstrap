@@ -230,4 +230,23 @@ mkdir -p /home/agent/.noisedeck
       >>/home/agent/.noisedeck/task-hygiene.log 2>&1 || true
   done
 ) &
+(
+  # Reviewer model refresh: when a pinned reviewer model is no longer the
+  # newest in its own vendor-and-tier family, open one like-for-like offer
+  # PR. Runs here, not in CI, because the claude probe needs the local
+  # catalog the workspace CLI carries. Like the hygiene loop, the first
+  # pass waits a full interval and a bad interval value must not tighten
+  # the loop.
+  interval=${NOISEDECK_MODEL_OFFER_INTERVAL:-86400}
+  case "$interval" in
+    *[!0-9]*|"") interval=86400 ;;
+    *) case "$interval" in *[1-9]*) ;; *) interval=86400 ;; esac ;;
+  esac
+  repo=${NOISEDECK_MODEL_OFFER_REPO:-/workspace/deck}
+  while true; do
+    sleep "$interval"
+    /usr/local/bin/noisedeck-model-offer --repo "$repo" \
+      >>/home/agent/.noisedeck/model-offer.log 2>&1 || true
+  done
+) &
 exec /usr/local/bin/noise deck serve "$@"

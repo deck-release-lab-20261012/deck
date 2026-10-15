@@ -51,8 +51,10 @@ func TestOmpRejectsAnAssignedSessionID(t *testing.T) {
 // as a case-insensitive prefix and returns the FIRST match with no
 // ambiguity failure, so Deck must replay the full uuid. --continue/-c is
 // recency; the hidden --session alias shares the prefix resolver; --fork
-// branches — all forbidden. The resume argv is intentionally bare: omp
-// restores model/thinking/history from the resumed session's header.
+// branches — all forbidden. The capture hook rides along on resume
+// (MEASURED: session_start delivers the resumed id; --hook never leaks
+// into stored session state), so the resumed process recaptures its id
+// through the startup callback.
 func TestOmpResumeTargetsExactFullUUID(t *testing.T) {
 	d := mustOmp(t)
 	const id = "019fe8dc-09c7-7000-80b9-25ea68620681"
@@ -61,7 +63,8 @@ func TestOmpResumeTargetsExactFullUUID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResumeSessionArgs: %v", err)
 	}
-	want := []string{"/usr/local/bin/omp", "--resume", id}
+	want := []string{"/usr/local/bin/omp", "--resume", id,
+		"--hook", "/home/claude/.omp/noisedeck-provider-hook.ts"}
 	if !reflect.DeepEqual(argv, want) {
 		t.Fatalf("resume argv = %v, want %v", argv, want)
 	}
@@ -69,6 +72,22 @@ func TestOmpResumeTargetsExactFullUUID(t *testing.T) {
 		if containsArg(argv, forbidden) {
 			t.Fatalf("resume argv contains ambiguous %s: %v", forbidden, argv)
 		}
+	}
+}
+
+// The resume flight's capture is startup-shaped: omp's session_start fires
+// on a resumed process and posts the same source a fresh launch posts, so
+// the descriptor declares exactly that, byte-for-byte.
+func TestOmpResumeCaptureIsStartupShaped(t *testing.T) {
+	capturer, ok := Descriptor(mustOmp(t)).(StartupResumeCaptureDescriptor)
+	if !ok {
+		t.Fatal("omp does not declare a resume capture source")
+	}
+	if got := capturer.ResumeCaptureHookSource(); got != "startup" {
+		t.Fatalf("resume capture source = %q, want the startup source a resumed session_start posts", got)
+	}
+	if _, attesting := Descriptor(mustOmp(t)).(ResumeIdentityAttestationDescriptor); attesting {
+		t.Fatal("omp declares a resume-shaped attestation the pinned hook never emits")
 	}
 }
 
@@ -96,7 +115,8 @@ func TestOmpResumeReplaysRecordedIDVerbatim(t *testing.T) {
 			t.Errorf("ResumeSessionArgs refused recorded id %q: %v", id, err)
 			continue
 		}
-		want := []string{"/usr/local/bin/omp", "--resume", id}
+		want := []string{"/usr/local/bin/omp", "--resume", id,
+			"--hook", "/home/claude/.omp/noisedeck-provider-hook.ts"}
 		if !reflect.DeepEqual(argv, want) {
 			t.Errorf("resume argv = %v, want %v", argv, want)
 		}

@@ -34,13 +34,14 @@ evidence:
 
 runtime_compatibility_probe:
   # These are upgrade-time syntax checks, not a launch-time help gate.
-  # --no-daemon was verified with the pinned 0.162.1 CLI; older external
-  # executables must support the same declared flag to use this descriptor.
+  # --no-daemon and --no-alt-screen were verified with the pinned 0.162.1
+  # CLI; older external executables must support the same declared flags to
+  # use this descriptor.
   commands:
     - args: ["--help"]
-      required_flags: ["--no-daemon", "--dangerously-bypass-approvals-and-sandbox"]
+      required_flags: ["--no-daemon", "--no-alt-screen", "--dangerously-bypass-approvals-and-sandbox"]
     - args: ["resume", "--help"]
-      required_flags: ["--no-daemon", "--dangerously-bypass-approvals-and-sandbox"]
+      required_flags: ["--no-daemon", "--no-alt-screen", "--dangerously-bypass-approvals-and-sandbox"]
       required_usage_tokens: ["[SESSION_ID]"]
   scope: command-line-syntax-only
   does_not_remeasure: [exact-resume, injection, modal-handling, containment]
@@ -217,8 +218,19 @@ identity:
   session_isolation_measurement:
     version: "0.162.1"
     measured_platforms: [linux-arm64-on-macos, linux-amd64]
-    launch_argv: ["/usr/local/bin/codex", "--no-daemon"]
-    resume_argv: ["/usr/local/bin/codex", "--no-daemon", "resume", "$NATIVE_ID"]
+    launch_argv: ["/usr/local/bin/codex", "--no-daemon", "--no-alt-screen"]
+    resume_argv: ["/usr/local/bin/codex", "--no-daemon", "--no-alt-screen", "resume", "$NATIVE_ID"]
+    # --no-alt-screen added 2026-10-14, linux-amd64: inline rendering keeps
+    # the transcript in tmux pane history (alternate_on=0, history grew by
+    # the reply; scrolled-off lines recoverable by capture). In the alternate
+    # screen the pane history stayed empty under identical output, so
+    # scrolled-off transcript was unreachable and uncopyable from Deck's
+    # browser terminal. SessionStart/Stop identity (startup and resume, same
+    # id), exact resume with this flag order, and the native queue receive
+    # (probe_a2a_codex.py with its launch line patched to this argv) were
+    # re-measured PASS under the inline argv. The arm64 pass and the
+    # serialized-session facts above were measured on the argv without
+    # --no-alt-screen.
     native_features_unchanged: true
     native_code_mode_host_enabled: true
     serialized_new_sessions_have_distinct_hook_identities: true

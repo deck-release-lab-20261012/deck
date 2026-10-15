@@ -15,7 +15,7 @@ func TestDockerfileInstallsPinnedOmpCLI(t *testing.T) {
 	body := string(raw)
 	for _, required := range []string{
 		"ARG BUN_VERSION=1.3.14",
-		"ARG OMP_VERSION=18.10.1",
+		"ARG OMP_VERSION=18.10.3",
 		"unzip",
 		"export BUN_INSTALL=/usr/local",
 		`curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}"`,

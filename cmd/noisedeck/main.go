@@ -23,6 +23,7 @@ import (
 	"github.com/noisefloor-oss/deck/internal/boot"
 	"github.com/noisefloor-oss/deck/internal/config"
 	"github.com/noisefloor-oss/deck/internal/harnesslogin"
+	"github.com/noisefloor-oss/deck/internal/project"
 	"github.com/noisefloor-oss/deck/internal/tasks"
 )
 
@@ -49,6 +50,18 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	switch args[0] {
+	case "internal-task-exec-v1":
+		if err := tasks.RunNativeTaskExec(args[1:]); err != nil {
+			writeln(stderr, "native Tasks execution refused")
+			return 1
+		}
+		return 0
+	case "internal-clone-exec-v1":
+		if err := project.RunNativeCloneExec(args[1:]); err != nil {
+			writeln(stderr, "native clone execution refused")
+			return 1
+		}
+		return 0
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return 0

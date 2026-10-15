@@ -56,6 +56,8 @@ function fakeApi(overrides: Partial<ApiClient> = {}): ApiClient {
     saveSettings: (next: ConsoleSettings) => Promise.resolve(next),
     getLayout: () => Promise.resolve({ expanded: [], projects: [], sessions: {} }),
     saveLayout: (next: SidebarLayout) => Promise.resolve(next),
+    getLastSession: () => Promise.resolve(null),
+    saveLastSession: () => Promise.resolve(),
     getTutorial: () => Promise.resolve(null),
     saveTutorial: (next: TutorialPreference) => Promise.resolve({ ...next, scope: "operator" }),
     deleteSession: () => Promise.resolve(),
@@ -428,7 +430,11 @@ test("a failing session refresh keeps the project but drops unverified rows", as
   assert.deepEqual(errors, []);
 });
 
-test("a failed projects fetch surfaces through onError without retaining session rows", async () => {
+// A server that cannot be reached has not said the sessions are gone. The
+// last served list stays, marked stale, and the selection stays with it:
+// a redeploy's ten seconds of refused connections must not tear the
+// terminal down and forget which session the operator was in.
+test("a failed projects fetch surfaces through onError and keeps the last served rows as stale", async () => {
   const good = new SidebarModel(fakeApi());
   await good.refresh();
   const before = good.groups;
@@ -446,10 +452,117 @@ test("a failed projects fetch surfaces through onError without retaining session
   bad.selectedSessionID = "s1";
   await bad.refresh();
   assert.deepEqual(errors, ["db gone"]);
-  assert.deepEqual(bad.groups.map((group) => group.project), before.map((group) => group.project));
-  assert.ok(bad.groups.every((group) => group.sessions.length === 0));
-  assert.equal(bad.selectedSessionID, null);
-  assert.deepEqual(deselected, ["s1"]);
+  assert.equal(bad.listState, "error");
+  assert.equal(bad.stale, true, "the kept rows are marked unconfirmed");
+  assert.equal(bad.registryReadOk, false);
+  assert.deepEqual(bad.groups, before, "nothing the server last said is dropped");
+  assert.equal(bad.selectedSessionID, "s1", "the selection survives an unreachable server");
+  assert.deepEqual(deselected, []);
+  assert.equal(bad.select("s1"), false, "a stale row refuses selection until confirmed");
+});
+
+test("a failed first read with nothing to keep is error, not stale", async () => {
+  const m = new SidebarModel(
+    fakeApi({ listProjects: () => Promise.reject(new ApiError(500, "internal", "db gone")) }),
+  );
+  assert.equal(m.listState, "loading", "nothing has answered yet");
+  await m.refresh();
+  assert.equal(m.listState, "error");
+  assert.equal(m.stale, false);
+  assert.deepEqual(m.groups, []);
+});
+
+test("a successful read confirms the list and writes the cache", async () => {
+  const store = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, value: string) => { store.set(key, value); },
+    removeItem: (key: string) => { store.delete(key); },
+  };
+  const m = new SidebarModel(fakeApi(), {}, false, storage);
+  assert.equal(m.stale, false, "no cache, nothing to draw");
+  await m.refresh();
+  assert.equal(m.listState, "ready");
+  assert.equal(m.stale, false);
+  assert.equal(store.size, 1, "the served list is remembered for the next cold load");
+
+  // The next cold load draws the remembered list, stale, until the server
+  // answers; a served answer then replaces it wholesale, dropping what the
+  // server no longer has.
+  const next = new SidebarModel(fakeApi({ listProjects: () => Promise.resolve([projects[0]!]) }), {}, false, storage);
+  assert.equal(next.listState, "loading");
+  assert.equal(next.stale, true);
+  assert.deepEqual(next.groups.map((group) => group.project.id), ["p1", "p2"]);
+  assert.equal(next.select("s1"), false, "a cached row is inert");
+  await next.refresh();
+  assert.equal(next.stale, false);
+  assert.deepEqual(next.groups.map((group) => group.project.id), ["p1"]);
+  assert.equal(next.select("s1"), true);
+});
+
+// A cache the model cannot render from is dropped at read time, not
+// carried into construction: the first render would throw on a malformed
+// row, the loading pane would never mount, and no server answer could
+// replace an entry nothing reads past.
+test("a cache that does not parse or does not hold the rail's shape is dropped", () => {
+  const validProject = { id: "p1", name: "alpha", canonical_path: "/srv/alpha", last_used_at: "t1" };
+  const validSession = sessions.p1![0]!;
+  const malformed: string[] = [
+    "{not json",
+    JSON.stringify({ groups: "nope" }),
+    JSON.stringify({ groups: [null] }),
+    JSON.stringify({ groups: [{ project: { id: "p1" }, sessions: [] }] }),
+    JSON.stringify({ groups: [{ project: validProject, sessions: [null] }] }),
+    JSON.stringify({ groups: [{ project: validProject, sessions: [{ id: "s1" }] }] }),
+    JSON.stringify({ groups: [{ project: validProject, sessions: [{ ...validSession, presentation_state: 7 }] }] }),
+    JSON.stringify({ groups: [{ project: validProject, sessions: [{ ...validSession, presentation_state: "nope" }] }] }),
+    // Optional fields are typed too: a tile renderer that reads color as a
+    // string must never meet an object there.
+    JSON.stringify({ groups: [{ project: validProject, sessions: [{ ...validSession, color: { toString: null } }] }] }),
+    JSON.stringify({ groups: [{ project: validProject, sessions: [{ ...validSession, last_output_at: 12 }] }] }),
+    // The rail keys plain objects by id, so an id that names an inherited
+    // property would read a function where a saved order was expected.
+    ...["__proto__", "constructor", "toString", "hasOwnProperty", ""].flatMap((id) => [
+      JSON.stringify({ groups: [{ project: { ...validProject, id }, sessions: [] }] }),
+      JSON.stringify({ groups: [{ project: validProject, sessions: [{ ...validSession, id }] }] }),
+      JSON.stringify({ groups: [{ project: validProject, sessions: [{ ...validSession, project_id: id }] }] }),
+    ]),
+  ];
+  for (const raw of malformed) {
+    const store = new Map<string, string>([["noisedeck.session-list", raw]]);
+    const storage = {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => { store.set(key, value); },
+      removeItem: (key: string) => { store.delete(key); },
+    };
+    const m = new SidebarModel(fakeApi(), {}, false, storage);
+    assert.deepEqual(m.groups, [], `rejected: ${raw}`);
+    assert.equal(m.stale, false);
+    assert.equal(store.size, 0, `a rejected cache is cleared: ${raw}`);
+  }
+  const store = new Map<string, string>([["noisedeck.session-list", JSON.stringify({ groups: [{ project: validProject, sessions: [validSession] }] })]]);
+  const storage = {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: () => {},
+    removeItem: (key: string) => { store.delete(key); },
+  };
+  const m = new SidebarModel(fakeApi(), {}, false, storage);
+  assert.equal(m.groups.length, 1, "a well-formed cache is drawn");
+  assert.equal(m.stale, true);
+
+  // A cached record is rebuilt from the fields the rail renders, so a key
+  // the server never served does not ride along, and a null colour is
+  // kept as the explicit "no override" the tile renderer understands.
+  const extra = new Map<string, string>([["noisedeck.session-list", JSON.stringify({
+    groups: [{ project: { ...validProject, surprise: 1 }, sessions: [{ ...validSession, color: null, surprise: 1 }] }],
+  })]]);
+  const kept = new SidebarModel(fakeApi(), {}, false, {
+    getItem: (key: string) => extra.get(key) ?? null,
+    setItem: () => {},
+    removeItem: () => {},
+  });
+  assert.deepEqual(kept.groups[0]!.project, validProject);
+  assert.deepEqual(kept.groups[0]!.sessions[0], { ...validSession, color: null });
 });
 
 test("select marks and reports only a verified running session", async () => {

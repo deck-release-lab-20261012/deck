@@ -70,6 +70,12 @@ type Manager struct {
 	// safe defaults, which is what the session tests exercise.
 	settings               SkipPermissionsReader
 	resumeAttestationBound time.Duration
+	// resumeSweepBound budgets ONE automatic-recovery pass, not the whole
+	// backlog: a candidate that cannot finish inside what remains is left
+	// for the next reconciliation pass, and a pass whose budget expires
+	// mid-flight unwinds the admission itself (see AutoResumeSweep). Tests
+	// shrink it to exercise the truncation.
+	resumeSweepBound time.Duration
 	// These fields are populated only for the default-off capacity-routing experiment.
 	// The capability is an in-memory accident boundary for the shared HTTP
 	// listener, not an operator identity or a confinement claim.
@@ -164,6 +170,10 @@ func NewManager(repo *Repository, t *tmux.Client, providers map[provider.Name]pr
 		// well inside this and never waits it out; only a silent hook pays
 		// the full bound before its pane commits anyway.
 		resumeAttestationBound: 10 * time.Second,
+		// Sized so one boot pass recovers an operator-sized backlog of
+		// quick candidates plus a couple of attested ones; whatever does
+		// not fit is resumed by the reconciler's next passes, never dropped.
+		resumeSweepBound: 30 * time.Second,
 	}
 }
 

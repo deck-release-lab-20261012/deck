@@ -223,7 +223,11 @@ func Up(ctx context.Context, cfg *config.Config, log zerolog.Logger, opts ...UpO
 		return p.Name, nil
 	})
 	h.Manager.SetDisplayNameRegistrar(session.A2ADisplayNameRegistrar(cfg.Chats.Executable, log))
-	if err := h.Manager.SetTemporaryRoot("/tmp"); err != nil {
+	temporaryBase, err := filepath.EvalSymlinks("/tmp")
+	if err != nil {
+		return nil, fmt.Errorf("boot: resolve provider temporary base: %w", err)
+	}
+	if err := h.Manager.SetTemporaryRoot(temporaryBase); err != nil {
 		return nil, fmt.Errorf("boot: provider temporary storage: %w", err)
 	}
 	h.Leases = lease.NewManager(h.DB)

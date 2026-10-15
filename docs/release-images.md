@@ -17,6 +17,8 @@ match; an older cached set is never relabeled as a newer main commit.
 
 ## Enable once
 
+For release rehearsals, optional repository variables `NOISE_TASKS_REPO` and `NOISE_SDLC_REPO` select trusted dependency mirrors. Acceptance, public-image and private-image builds forward them through Compose. Leave them unset for the canonical source URLs; local Compose builds accept the same environment names. Use credential-free HTTPS GitHub URLs owned by the selected rehearsal organization. Only the repository location changes: Dockerfile commit and version pins, exact checkout assertions and image admission remain unchanged. Mirror the already reviewed public snapshot at those exact commits rather than publishing a canonical repository merely to satisfy a rehearsal build. This does not authorize canonical OSS publication.
+
 Set repository variables:
 
 - `NOISEDECK_RELEASE_IMAGES_ENABLED=true`

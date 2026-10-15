@@ -182,10 +182,11 @@ recipient the roster places on this host tries in order:
 
 | Rung | Harness | Mechanism |
 |---|---|---|
-| extension | pi, omp | The a2a Pi extension polls the inbox while the agent is idle and hands the message over as a new user prompt. The courier does nothing, to avoid a duplicate. |
-| opencode-plugin | opencode | The a2a OpenCode plugin does the same through the session's own server API: lifecycle events are presence, and while the session is idle the plugin hands unread mail over as a native prompt. The admission receipt is what marks the message read; a send with no receipt stays unread and is never submitted again. |
+| extension | pi, omp | The a2a Pi extension follows the inbox while the agent is idle — one long-lived `a2a inbox --follow --json` child per session, woken by the relay's own wait — and hands the message over as a new user prompt the moment it lands. Wakes that arrive mid-turn are buffered and replayed when the turn ends. The child's stdin is a pipe the extension holds open and never writes, so it dies with its session even on a crash; while it is down one peek covers the gap, and `A2A_PI_FOLLOW=0` falls back to the polling interval. A box the session already handed off is never submitted twice, even from a stale gap peek. The courier does nothing, to avoid a duplicate. |
+| opencode-plugin | opencode | The a2a OpenCode plugin does the same through the session's own server API: lifecycle events are presence, and while the session is idle the plugin hands unread mail over as a native prompt — follower-driven, with the same stdin binding, busy-wake replay, gap peek and `A2A_OPENCODE_FOLLOW=0` fallback. The admission receipt is what marks the message read; a send with no receipt stays unread and is never submitted again, and a box the session already handed off is never submitted twice, even from a stale gap peek. A session error interrupts following but never disables it; only deletion ends it. |
 | codex-queue | codex | `codex queue --thread <native session> --message ...` when the native id is known from a hook or a scanned resume command line. |
-| inbox-only | other harnesses, or Codex without a native session | No automatic submission. The message stays unread for a native hook or an explicit inbox/read/wait. Kimi has no external enqueue path into an interactive session: its Server API accepts prompts only for sessions started under `kimi web`, so a Kimi agent receives through its own hooks, below. |
+| claude-socket | claude | The courier writes the wake line as one NDJSON `user` message to the session's cross-session inbox socket (Claude Code v2.1.224+), whose path the SessionStart hook announces in presence from `CLAUDE_CODE_MESSAGING_SOCKET`. An idle session starts a new turn with the message; a busy one reads it between tool calls. The token the socket pair exports is never announced: on Linux the socket needs no auth line, and the operator's hook environment is the only place the token exists. This needs `crossSessionInbound: accept` in the provisioned settings, because the default inbound rules hold a non-child post behind an approval dialog in a bypass-mode session, which is every session Deck launches. |
+| inbox-only | other harnesses, or a peer without its native handle | No automatic submission. The message stays unread for a native hook or an explicit inbox/read/wait. Kimi has no external enqueue path into an interactive session: its Server API accepts prompts only for sessions started under `kimi web`, so a Kimi agent receives through its own hooks, below. |
 
 The wake line is one line, at most about 400 characters of body, and tells
 the agent what to run:
@@ -205,14 +206,17 @@ Deck's explicit operator input path is a separate feature.
 - **Unavailable.** The recipient is absent or its socket is outside this
   courier's configured set. Retried up to three times a minute apart, then
   left for the recipient's next turn.
-- **Delivered.** The native Codex queue command returned success. This means
-  queue acceptance, not that the model read or acted on the message. The
+- **Delivered.** The native Codex queue command returned success, or the
+  Claude inbox socket accepted the wake line. This means
+  acceptance, not that the model read or acted on the message. The
   courier acknowledges with status `ready`; a failed acknowledgement is
   retried without submitting the message again.
-- **Uncertain.** The queue command started but failed or timed out. It may
-  have accepted the message, so it is never retried. The courier records
+- **Uncertain.** The queue command started but failed or timed out, or the
+  socket write failed after connecting. The message may
+  have been accepted, so it is never retried. The courier records
   status `failed`, `uncertain for <handle>`, and leaves the message unread.
-  If the executable could not start, the result is inbox-only.
+  If the executable could not start, or the socket was missing or refused,
+  the result is inbox-only.
 
 The Pi extension uses the native extension API `sendUserMessage` while idle
 and marks read only after `before_agent_start` reports that exact prompt.
@@ -270,13 +274,13 @@ trusted native session id is available; otherwise use `a2a wait` or
 No lifecycle hook wakes an already idle session, on any harness: a Stop
 hook runs when a turn ends, not when mail arrives afterwards. The rungs
 that wake an idle recipient are the native ones — the Pi-family extension,
-the OpenCode plugin, and the Codex queue. A Claude or Kimi session that is
-already idle reads new mail at its operator's next turn, where the prompt
-hook surfaces it first. `a2a chat` and `a2a reply` say so when they address
-such a peer, so a sender is never left guessing at silence; neither CLI
-offers a local enqueue into an interactive session today (Claude Code tracks
-that as an open feature request, and Kimi's Server API accepts prompts only
-for sessions started under `kimi web`).
+the OpenCode plugin, the Codex queue, and the Claude inbox socket. A Kimi
+session that is already idle reads new mail at its operator's next turn,
+where the prompt hook surfaces it first. `a2a chat` and `a2a reply` say so when they address
+such a peer, so a sender is never left guessing at silence; Kimi offers no
+local enqueue into an interactive session today (its Server API accepts
+prompts only for sessions started under `kimi web`;
+MoonshotAI/kimi-code#4232 tracks one).
 
 Codex 0.160+ runs hooks in a shared app-server daemon. Codex hook presence
 binds to the pane whose Codex process command line names the payload's
@@ -627,7 +631,7 @@ in ADR-0009 or add a terminal input path for the courier.
 Every harness's native receive path has an isolated probe that drives the
 real CLI — `deploy/mempalace/probe_a2a_receive.py --harness {omp,pi,opencode}`
 for the in-process rungs, `probe_a2a_claude.py`, `probe_a2a_kimi.py` and
-`probe_a2a_codex.py` for the hook and queue rungs, plus
+`probe_a2a_codex.py` for the hook, queue and socket rungs, plus
 `probe_a2a_opencode_plugin.py`, which drives the OpenCode plugin's delivery
 contract against a stub session client when the serve bootstrap itself is the
 thing under suspicion. Each runs against a synthetic a2a mailbox and a

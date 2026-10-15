@@ -103,9 +103,13 @@ try {
       return json(201, identity);
     }
     if (path === "/api/settings/layout" && request.method() === "PUT") return json(200, request.postDataJSON());
+    // The project/session switch lesson clicks rows, and a row click is the
+    // operator choosing a session: that choice is remembered on the server.
+    if (path === "/api/settings/last-session" && request.method() === "PUT") return json(200, request.postDataJSON());
     assert.equal(request.method(), "GET", `tutorial caused unexpected mutation ${path}`);
     if (path === "/api/settings") return json(200, { skip_permissions: false, skip_close_confirm: false, skip_remove_project_confirm: false });
     if (path === "/api/settings/layout") return json(404, { code: "not_found" });
+    if (path === "/api/settings/last-session") return json(404, { code: "not_found", message: "no last session remembered" });
     if (path === "/api/projects") return json(200, [project, secondProject]);
     if (path.endsWith("/sessions")) return json(200, hasSession ? [path.includes("/p2/") ? secondSession : session] : []);
     if (path === "/api/sessions/s1") return json(200, session);
@@ -149,7 +153,8 @@ try {
   assert.ok((await panel.ariaSnapshot()).includes('heading "Tutorial"'));
   await clickSave(panel.getByRole("button", { name: "Next", exact: true }), true);
   await clickSave(panel.getByRole("button", { name: "Back", exact: true }), true);
-  assert.equal(await panel.getByRole("button", { name: "Next", exact: true }).evaluate((el) => el === document.activeElement), true,
+  // A save repaint replaces the buttons; query focus within the stable panel.
+  assert.equal(await panel.evaluate((el) => el.querySelector('[data-tutorial-action="next"]') === document.activeElement), true,
     "Back at the first step restores keyboard focus to Next");
   await page.keyboard.press("Enter");
   await page.waitForFunction(() => document.querySelector(".tutorial-lesson")?.textContent?.includes("Step 2"));

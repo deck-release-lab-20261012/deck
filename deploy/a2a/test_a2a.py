@@ -12,6 +12,7 @@ import re
 import runpy
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -613,6 +614,79 @@ class A2ACase(unittest.TestCase):
             self.run_cli(handle, "key", "announce")
         self.run_cli(pinner, "key", "trust", host, fp)
         return fp
+
+
+class FollowStreamTest(A2ACase):
+    """The follower is a long-lived peek: one JSON line of unread mail per
+    relay wake, nothing marked read by the stream itself."""
+
+    def setUp(self):
+        super().setUp()
+        self.online("alice", "bob")
+        patch = mock.patch.dict(os.environ, {"A2A_FOLLOW_MAX_WAKES": "3", "A2A_FOLLOW_SLICE_S": "1", "A2A_FOLLOW_BACKOFF_S": "0"})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def follow(self, waits) -> list[str]:
+        """Run the follower with a scripted wait; returns its lines. A
+        scripted entry that is an exception is raised, as the relay would."""
+        out = io.StringIO()
+        waits = iter(waits)
+
+        def next_wait(ms, **filters):
+            entry = next(waits)
+            if isinstance(entry, Exception):
+                raise entry
+            if callable(entry):
+                return entry()
+            return entry
+
+        with self.as_agent("bob"):
+            with mock.patch.object(a2a, "wait_events", side_effect=next_wait):
+                a2a.follow_stream(out=out)
+        return [json.loads(line) for line in out.getvalue().splitlines()]
+
+    def test_first_line_is_the_current_unread_opened_view(self):
+        self.run_cli("alice", "chat", "bob", "hello follower")
+        lines = self.follow([[{"id": "x", "room": a2a.ROOM_CHAT}], [], []])
+        self.assertEqual(len(lines), 3)
+        self.assertEqual([e["body"] for e in lines[0]], ["hello follower"], "opened bodies, compact JSON")
+        # Peek semantics: unread stays unread until its own receipt, so a
+        # later wake re-reports it and the extension's journal dedups.
+        self.assertEqual([e["body"] for e in lines[1]], ["hello follower"])
+        with self.as_agent("bob"):
+            self.assertEqual([e["id"] for e in a2a.unread()], [lines[0][0]["id"]], "the follower never marks read")
+
+    def test_a_new_event_wakes_the_next_line(self):
+        self.run_cli("alice", "chat", "bob", "first")
+        cid = a2a.chat_events()[0]["correlation_id"]
+        second = None
+        with self.as_agent("bob"):
+            a2a.acknowledge_chat(cid)
+
+            def mail_lands_mid_follow():
+                self.append_chat("alice", "chat.message", cid, body="second")
+                return [{"id": "x", "room": a2a.ROOM_CHAT}]
+
+        lines = self.follow([mail_lands_mid_follow, [], []])
+        self.assertEqual([e["body"] for e in lines[0]], [], "the first was acknowledged, nothing yet")
+        self.assertEqual([e["body"] for e in lines[1]], ["second"], "the wake that landed it reports it")
+
+    def test_a_refused_cursor_rescans_and_downtime_backs_off(self):
+        self.run_cli("alice", "chat", "bob", "steady")
+        refused = a2a.LogstreamError("mempalace_event_wait: since_event_id 'evt_dead' not found")
+        down = a2a.LogstreamError("connection refused")
+        lines = self.follow([[{"id": "x", "room": a2a.ROOM_CHAT}], refused, down, [], []])
+        self.assertEqual(len(lines), 3, "reset and downtime each cost a cycle, not the stream")
+        self.assertEqual([e["body"] for e in lines[0]], ["steady"])
+
+    def test_parity_with_peek_json(self):
+        self.run_cli("alice", "chat", "bob", "parity check")
+        lines = self.follow([[{"id": "x", "room": a2a.ROOM_CHAT}], [], []])
+        with self.as_agent("bob"):
+            peeked = [a2a.opened(e) for e in a2a.unread()]
+        self.assertEqual([{k: v for k, v in e.items()} for e in lines[0]],
+                         [{k: v for k, v in e.items()} for e in peeked])
 
 
 class PresenceStateTest(A2ACase):
@@ -2842,6 +2916,12 @@ class A2ATest(A2ACase):
         out = self.run_cli("alice", "reply", cid, "still here")
         self.assertIn("bob is idle on claude; it has no wake while idle", out)
 
+    def test_an_idle_claude_with_an_inbox_socket_carries_no_wake_warning(self):
+        self.presence("bob", harness="claude", kind="agent.idle", native_session="",
+                      inbox_socket="/tmp/cc-socks-1003/9.sock")
+        out = self.run_cli("alice", "chat", "bob", "hello")
+        self.assertNotIn("no wake while idle", out)
+
     def test_codex_session_start_hook_prints_plain_context_and_announces_the_native_id(self):
         self.online("bob")
         with mock.patch.object(a2a, "scan_panes", return_value=[]):
@@ -3044,6 +3124,89 @@ class A2ATest(A2ACase):
             a2a.main(["hook", "session-start", "--harness", "claude"])
         notice = json.loads(out.getvalue())
         self.assertIn("your handle is `bob`", notice["hookSpecificOutput"]["additionalContext"])
+
+    def test_claude_hooks_announce_the_inbox_socket(self):
+        self.online("bob")
+        env = {"CLAUDE_CODE_MESSAGING_SOCKET": "/tmp/cc-socks-1003/1.sock"}
+        with self.as_agent("bob"):
+            for event in ("session-start", "prompt", "stop"):
+                with self.subTest(event=event), mock.patch.dict(os.environ, env), \
+                        mock.patch.object(a2a, "courier_ensure"), \
+                        mock.patch.object(sys, "stdin", io.StringIO("{}")), \
+                        redirect_stdout(io.StringIO()):
+                    a2a.main(["hook", event, "--harness", "claude"])
+                metadata = a2a.metadata_of(self.ls.events[-1])
+                self.assertEqual(metadata.get("inbox_socket"), "/tmp/cc-socks-1003/1.sock",
+                                 f"a {event} announcement drops the socket and idles the rung")
+            row = a2a.roster()["bob"]
+            self.assertEqual(row["inbox_socket"], "/tmp/cc-socks-1003/1.sock")
+            with mock.patch.dict(os.environ, {"CLAUDE_CODE_MESSAGING_SOCKET": ""}), \
+                    mock.patch.object(sys, "stdin", io.StringIO("{}")), redirect_stdout(io.StringIO()):
+                a2a.main(["hook", "prompt", "--harness", "kimi"])
+        self.assertEqual(a2a.metadata_of(self.ls.events[-1]).get("inbox_socket"), "",
+                         "only Claude announces a socket")
+
+    def test_claude_delivery_mode_uses_the_socket_when_present(self):
+        row = {"handle": "bob", "harness": "claude", "inbox_socket": "/tmp/cc-socks-1003/1.sock",
+               "pane": {"socket": "/s", "pane": "%1"}}
+        self.assertEqual(a2a.delivery_mode(row), "claude-socket")
+        self.assertEqual(a2a.delivery_mode({**row, "inbox_socket": ""}), "inbox-only")
+        self.assertEqual(a2a.delivery_mode({**row, "pane": {"socket": "/foreign.sock", "pane": "%1"}}), "unavailable")
+        self.assertEqual(a2a.delivery_mode({**row, "harness": "kimi"}), "inbox-only")
+
+    def test_claude_socket_posts_one_user_message_line(self):
+        directory = Path(tempfile.mkdtemp(prefix="a2a-claude-sock-"))
+        self.addCleanup(lambda: shutil.rmtree(directory, ignore_errors=True))
+        path = directory / "in.sock"
+        received = []
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(path))
+        server.listen(1)
+        self.addCleanup(server.close)
+
+        def serve():
+            conn, _ = server.accept()
+            with conn:
+                data = b""
+                while not data.endswith(b"\n"):
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                received.append(data)
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            self.assertEqual(a2a._claude_socket(f"uds:{path}", "wake text"), "claude-socket")
+        finally:
+            thread.join(timeout=10)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(json.loads(received[0]),
+                         {"type": "user", "message": {"role": "user", "content": "wake text"}})
+
+    def test_claude_socket_refusal_is_inbox_only_and_a_failed_write_is_uncertain(self):
+        self.assertEqual(a2a._claude_socket("", "t"), "inbox-only")
+        self.assertEqual(a2a._claude_socket("not-a-path", "t"), "inbox-only")
+        self.assertEqual(a2a._claude_socket("/nonexistent/dir/x.sock", "t"), "inbox-only")
+        conn = mock.Mock()
+        conn.sendall.side_effect = OSError("broken pipe")
+        with mock.patch.object(a2a.socket, "socket", return_value=conn):
+            self.assertEqual(a2a._claude_socket("/tmp/x.sock", "t"), "uncertain")
+
+    def test_courier_delivers_to_claude_through_the_inbox_socket(self):
+        self.online("alice")
+        self.presence("bob", harness="claude", native_session="", inbox_socket="/inbox/bob.sock", pane="%3")
+        self.run_cli("alice", "chat", "bob", "hi")
+        pastes = []
+        with mock.patch.object(a2a, "_claude_socket", side_effect=lambda path, text: pastes.append((path, text)) or "claude-socket"), \
+                mock.patch.object(a2a, "_codex_queue", side_effect=AssertionError("the codex queue never serves claude")), \
+                mock.patch.object(a2a, "_age", return_value=1):
+            state = a2a.courier_once({}, "hostA", verbose=False)
+        self.assertEqual([path for path, _ in pastes], ["/inbox/bob.sock"])
+        self.assertEqual(state["pending"], {})
+        self.assertEqual([a2a.ack_note(a) for a in self.ls.events if a["type"] == "event.ack"],
+                         ["delivered to bob via claude-socket"])
 
     def test_stop_hook_reports_legacy_proposals_without_teaching_agreement(self):
         cid = self.legacy_chat("alice", "bob", "carol")
@@ -3367,8 +3530,9 @@ class A2ATest(A2ACase):
         sock = str(Path(self.tmp.name) / "draft.sock")
         result = Path(self.tmp.name) / "submitted"
         ready = Path(self.tmp.name) / "ready"
+        completed = Path(self.tmp.name) / "completed"
         base = ["tmux", "-S", sock]
-        command = "touch " + shlex.quote(str(ready)) + "; IFS= read -r draft; printf '%s' \"$draft\" > " + shlex.quote(str(result))
+        command = "touch " + shlex.quote(str(ready)) + "; IFS= read -r draft; printf '%s' \"$draft\" > " + shlex.quote(str(result)) + " && touch " + shlex.quote(str(completed))
         subprocess.run(base + ["-f", "/dev/null", "new-session", "-d", "-s", "draft", "bash", "--noprofile", "--norc", "-c", command], check=True)
         self.addCleanup(lambda: subprocess.run(base + ["kill-server"], capture_output=True))
         deadline = time.monotonic() + 5
@@ -3390,8 +3554,9 @@ class A2ATest(A2ACase):
         subprocess.run(base + ["send-keys", "-t", "draft:0.0", "-l", " finished"], check=True)
         subprocess.run(base + ["send-keys", "-t", "draft:0.0", "Enter"], check=True)
         deadline = time.monotonic() + 5
-        while not result.exists() and time.monotonic() < deadline:
+        while not completed.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
+        self.assertTrue(completed.exists(), "the terminal must finish writing the submitted draft")
         self.assertEqual(result.read_text(), "unfinished draft finished")
 
     def test_failed_native_queue_never_falls_back_to_terminal(self):

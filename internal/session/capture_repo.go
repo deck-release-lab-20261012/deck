@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -164,6 +165,35 @@ func (r *Repository) AcceptIdentityCapture(ctx context.Context, tokenHash string
 			outcome = hookcapture.ErrConflict
 			return nil
 		}
+
+		// A hook that names its reporting process is also believed about
+		// WHICH pane it speaks for: the conversation id must come from the
+		// process this generation recorded as its own. omp subagents
+		// inherit the pane's capture token and fire their own session_start
+		// with a fresh conversation id, and rolling the parent row to a
+		// child's id left it naming a conversation that never persisted —
+		// the next resume was refused for an id the provider never saw.
+		// A generation whose owning process is not (yet) recorded is not
+		// judged here: a recovery in flight pins its candidate's pid the
+		// moment the pane spawns, and before that there is no pane to
+		// impersonate.
+		if reportingPID := ev.PID; reportingPID != "" {
+			ownerPID, ownerErr := generationOwnerPIDTx(ctx, tx, sessionID, generation, marker)
+			if ownerErr != nil {
+				return ownerErr
+			}
+			if ownerPID != nil && strconv.Itoa(*ownerPID) != reportingPID {
+				if err := db.AppendAudit(ctx, tx, db.AuditEvent{
+					SessionID: &sessionID, Type: AuditIdentityCaptureRefused,
+					Details: fmt.Sprintf("provider=%s generation=%d reason=reporting_process native_id_sha256=%s",
+						provider, generation, hookcapture.NativeIDHash(ev.SessionID)),
+				}); err != nil {
+					return err
+				}
+				outcome = hookcapture.ErrConflict
+				return nil
+			}
+		}
 		// Replay idempotence: a delivery carrying the fact already recorded on
 		// this grant changes nothing, so a lost response costs nothing.
 		eventHash := hookcapture.AcceptedEventHash(provider, workDir, ev)
@@ -187,6 +217,53 @@ func (r *Repository) AcceptIdentityCapture(ctx context.Context, tokenHash string
 		return err
 	}
 	return outcome
+}
+
+// generationOwnerPIDTx reads the process id this generation recorded as its
+// own. A recovery in flight owns the candidate pid its slot pinned at
+// spawn; before that pin the generation's owner is deliberately
+// unverifiable, so a named capture in the window between admission and the
+// spawn's recording is judged against nothing — the row still carries the
+// previous generation's tuple, and omp's hook does not retry a 4xx, so
+// refusing there would permanently lose a legitimate attestation. With no
+// flight, a generation whose row is still live — starting or running —
+// owns its recorded pane pid; a terminal row's tuple belongs to whichever
+// generation last committed it and decides nothing. Nil means
+// unverifiable, and the caller declines to judge.
+func generationOwnerPIDTx(ctx context.Context, tx *sql.Tx,
+	sessionID string, generation int, marker string) (*int, error) {
+	var status string
+	var panePID, candidatePID sql.NullInt64
+	var slots int
+	err := tx.QueryRowContext(ctx, `
+		SELECT s.status, s.pane_pid,
+			(SELECT COUNT(*) FROM session_successor_slots slot
+			 WHERE slot.session_id = s.id
+			   AND slot.candidate_generation = s.generation),
+			(SELECT slot.candidate_pane_pid FROM session_successor_slots slot
+			 WHERE slot.session_id = s.id
+			   AND slot.candidate_generation = s.generation) AS candidate_pid
+		FROM sessions s
+		WHERE s.id = ? AND s.generation = ? AND s.identity_marker = ?`,
+		sessionID, generation, marker).Scan(&status, &panePID, &slots, &candidatePID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("identity capture: read generation owner: %w", err)
+	}
+	if slots > 0 {
+		if candidatePID.Valid && candidatePID.Int64 > 1 {
+			owner := int(candidatePID.Int64)
+			return &owner, nil
+		}
+		return nil, nil
+	}
+	if (status == string(StatusRunning) || status == string(StatusStarting)) && panePID.Valid && panePID.Int64 > 1 {
+		owner := int(panePID.Int64)
+		return &owner, nil
+	}
+	return nil, nil
 }
 
 // recordReportedIdentityTx writes the conversation the pane just named onto
